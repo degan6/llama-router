@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from llama_router import request_logger
 from llama_router.config import Settings, settings
 from llama_router.dashboard import deps as dash_deps
+from llama_router.dashboard import management_keys as dash_management_keys
 from llama_router.dashboard import routes as dash_routes
 from llama_router.dashboard.app import app as dashboard_app
 from llama_router.dashboard.decisions import router as dash_decisions_router
@@ -71,6 +72,9 @@ async def dash_client(
     )
     monkeypatch.setattr(settings, "dashboard_cookie_secure", False)
     monkeypatch.setattr(dash_routes, "login_attempt_limiter", LoginAttemptLimiter())
+    # Key IDs are reused by each isolated database; last-use throttling must
+    # not carry timestamps from a previous database into the next test.
+    monkeypatch.setattr(dash_management_keys, "_touched", {})
 
     db = Database(str(tmp_path / "dash_auth.db"))
     await db.connect()
