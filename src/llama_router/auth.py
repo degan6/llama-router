@@ -15,11 +15,14 @@ from .background import spawn
 from .config import settings
 from .database import AUTH_CHANGES, CHANGE_PROVIDERS, Database
 from .decision_policy import DecisionPolicy, parse_policy
-from .router import ROUTING_MODES, RoutingPreferences
+from .pricing import estimate_tokens
+from .provider_secrets import server_secret
+from .router import ROUTING_MODES, Router, RouteResult, RoutingPreferences
 from .routing_table import DEFAULT_MODE
-from .spend import tracker_for
+from .spend import RESERVATION_STATE, cap_reached, tracker_for
 from .upstream_url import LOCALITIES
-from .worker_link.protocol import HUB_HEADER, HUB_HEADER_VALUE, PROVIDER_HEADER
+from .worker_link.relay import SCOPE_KEY as _RELAY_SCOPE_KEY
+from .worker_link.relay import is_own_relay
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +49,32 @@ def key_hash_legacy(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def key_hash(key: str) -> str:
-    """Fingerprint for API key storage using PBKDF2-HMAC-SHA256."""
-    pepper_src = (settings.session_secret or "").strip()
-    pepper = (
-        pepper_src.encode("utf-8") if pepper_src else b"llama-router-api-key-pepper-dev"
-    )
+# The fixed pepper older releases used without a session secret. Keys
+# hashed with it still match and are re-hashed with the current pepper.
+_LEGACY_DEV_PEPPER = b"llama-router-api-key-pepper-dev"
+
+
+def _pbkdf2(key: str, pepper: bytes) -> str:
     return hashlib.pbkdf2_hmac(
         "sha256",
         key.encode("utf-8"),
         pepper,
         _PBKDF2_ROUNDS,
     ).hex()
+
+
+def key_hash(key: str) -> str:
+    """Fingerprint for API key storage using PBKDF2-HMAC-SHA256.
+
+    The pepper is ``LLAMA_ROUTER_SESSION_SECRET``, or the generated secret
+    file's value when that is not set.
+    """
+    return _pbkdf2(key, server_secret())
+
+
+def key_hash_legacy_pepper(key: str) -> str:
+    """PBKDF2 fingerprint with the old fixed development pepper."""
+    return _pbkdf2(key, _LEGACY_DEV_PEPPER)
 
 
 class _AuthCache:
@@ -122,11 +139,33 @@ async def _resolve_key(
     *legacy* is ``key_hash_legacy(key)``, already computed by the caller.
     """
     record = await db.lookup_api_key(legacy)
-    if not record:
-        # PBKDF2 takes tens of milliseconds; keep it off the event loop.
-        modern = await asyncio.to_thread(key_hash, key)
+    # PBKDF2 takes tens of milliseconds; keep it off the event loop.
+    modern = await asyncio.to_thread(key_hash, key)
+    if record:
+        # Stored in the old plain SHA-256 form: upgrade it now that we have
+        # the key. Lookups still try the legacy form first, then PBKDF2.
+        if modern != legacy:
+            try:
+                await db.set_api_key_hash(int(record["id"]), modern)
+                logger.info("Upgraded API key %s to a PBKDF2 hash", record["id"])
+            except Exception:
+                logger.warning(
+                    "Could not upgrade the hash of API key %s",
+                    record["id"],
+                    exc_info=True,
+                )
+    else:
         if modern != legacy:
             record = await db.lookup_api_key(modern)
+        if not record and not settings.session_secret.strip():
+            # Created before the generated secret replaced the fixed pepper.
+            old = await asyncio.to_thread(key_hash_legacy_pepper, key)
+            record = await db.lookup_api_key(old)
+            if record:
+                await db.set_api_key_hash(int(record["id"]), modern)
+            else:
+                # A concurrent request may have just re-hashed it.
+                record = await db.lookup_api_key(modern)
     if not record:
         return None
     mode = str(record["routing_mode"]).lower()
@@ -165,18 +204,23 @@ LOCALITY_HEADER = "X-Llama-Router-Locality"
 
 
 def from_hub(request: Request) -> bool:
-    """The request was relayed by the worker link from this router's hub."""
-    value = (request.headers.get(HUB_HEADER) or "").strip().lower()
-    return value == HUB_HEADER_VALUE
+    """The request was relayed by the worker link from this router's hub.
+
+    Set by :class:`~.worker_link.relay.HubRelayMiddleware` only for jobs the
+    worker link in this process sent; the headers alone mean nothing.
+    """
+    relay = request.scope.get(_RELAY_SCOPE_KEY)
+    return isinstance(relay, dict) and bool(relay.get("hub"))
 
 
 def hub_provider(request: Request) -> int | None:
     """The one provider a job from this router's hub is for, when the worker
     shares providers individually; None for any other request."""
-    if not from_hub(request):
+    relay = request.scope.get(_RELAY_SCOPE_KEY)
+    if not isinstance(relay, dict):
         return None
-    raw = (request.headers.get(PROVIDER_HEADER) or "").strip()
-    return int(raw) if raw.isdigit() else None
+    pid = relay.get("provider")
+    return pid if isinstance(pid, int) else None
 
 
 def _locality(value: Any) -> str | None:
@@ -228,15 +272,78 @@ async def _apply_spend_cap(
     cap = prefs.daily_spend_cap_usd
     if cap is None or prefs.key_id is None:
         return prefs
-    spent = await tracker_for(db).spent_today(prefs.key_id)
+    spent = await tracker_for(db).committed_today(prefs.key_id)
     if spent < cap:
         return prefs
     if prefs.locality == "cloud":
-        raise HTTPException(
-            status_code=429,
-            detail=f"daily spend cap of ${cap:.2f} reached for this API key",
-        )
+        raise cap_reached(cap)
     return replace(prefs, locality="local", spend_capped=True)
+
+
+def _is_media_endpoint(path: str) -> bool:
+    return "/images/" in path or "/audio/" in path
+
+
+async def route_within_cap(
+    rt: Router,
+    db: Database,
+    request: Request,
+    model: str,
+    prefs: RoutingPreferences | None,
+    body: Any,
+    *,
+    session: str | None = None,
+) -> RouteResult | None:
+    """Route the request, holding its estimated cost against the key's cap.
+
+    On a key with a daily spend cap, a request routed to a priced cloud model
+    reserves its estimated cost (see spend.py); the request log settles the
+    reservation (``request.state.spend_reservation``). If the estimate does
+    not fit under the cap, or an image or audio request lands on a cloud model
+    with no price (its cost could not be counted), the request is routed to
+    local providers instead, or refused (HTTP 429 over the cap, 403 for an
+    unpriced model) when that is not possible.
+    """
+    path = request.url.path
+    result = await rt.route(model, path, prefs, session=session)
+    if (
+        result is None
+        or prefs is None
+        or prefs.key_id is None
+        or prefs.daily_spend_cap_usd is None
+        or not result.provider.is_cloud
+    ):
+        return result
+    cap = prefs.daily_spend_cap_usd
+    price = rt.price_for(result.provider.require_id(), result.model_key)
+    if price is None:
+        if not _is_media_endpoint(path):
+            return result  # unknown cost, as without a cap
+        status = 403
+        reason = f"model '{model}' has no price, so its cost cannot be capped"
+    else:
+        estimate = price.cost(
+            *estimate_tokens(body, settings.spend_estimate_completion_tokens)
+        )
+        if estimate <= 0:
+            return result
+        held = await tracker_for(db).reserve(prefs.key_id, cap, estimate)
+        if held is not None:
+            setattr(request.state, RESERVATION_STATE, held)
+            return result
+        status = 429
+        reason = f"daily spend cap of ${cap:.2f} reached for this API key"
+    local = None
+    if prefs.locality != "cloud":
+        local = await rt.route(
+            model,
+            path,
+            replace(prefs, locality="local", spend_capped=True),
+            session=session,
+        )
+    if local is None:
+        raise HTTPException(status_code=status, detail=reason)
+    return local
 
 
 def client_api_key(request: Request) -> str:
@@ -258,7 +365,9 @@ async def _key_preferences(db: Database, request: Request) -> RoutingPreferences
     key = client_api_key(request)
 
     if not key:
-        if await _allow_unauthenticated(db, cache):
+        # This router's own worker relaying a hub job; the hub authenticated
+        # the job, and HUB_HEADER still narrows it to the shared providers.
+        if is_own_relay(request) or await _allow_unauthenticated(db, cache):
             return None
         raise HTTPException(
             status_code=401,
@@ -280,8 +389,8 @@ async def _key_preferences(db: Database, request: Request) -> RoutingPreferences
     generation = cache.generation
     resolved = await _resolve_key(db, key, fingerprint)
     if resolved is None:
-        if await _allow_unauthenticated(db, cache):
-            return None
+        # Even with anonymous access on: a client that sends a wrong or
+        # revoked key should find out rather than silently lose its limits.
         raise HTTPException(status_code=401, detail="Invalid API-KEY")
     prefs, key_id = resolved
     # lookup_api_key just wrote last_used_at.

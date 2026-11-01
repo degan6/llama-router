@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
 import time
@@ -27,11 +28,12 @@ from .. import metrics as metrics_mod
 from ..affinity import session_key
 from ..auth import generate_api_key, key_hash, key_prefix
 from ..background import spawn
+from ..client_address import client_ip
 from ..cloud_presets import PRESETS, get_preset
 from ..config import settings
 from ..httpx_errors import describe_httpx_error
 from ..models import ProviderProtocol, RequestLog
-from ..probe import FAMILY_LABELS, probe_url
+from ..probe import FAMILY_LABELS, BlockedAddressError, probe_url
 from ..provider_manager import preset_settings
 from ..provider_secrets import format_extra_headers, parse_extra_headers
 from ..router import (
@@ -51,9 +53,10 @@ from ..worker_link.worker import normalize_hub_url
 from . import deps, management_keys, oidc
 from .auth_core import (
     AUTH_COOKIE,
-    SESSION_MAX_AGE,
+    burn_password_check,
     hash_password,
     normalize_username,
+    session_max_age,
     sign_session,
     verify_password,
 )
@@ -320,21 +323,9 @@ router = APIRouter()
 
 
 def template_auth_ctx(request: Request) -> dict[str, Any]:
-    if getattr(request.state, "auth_bootstrap", False):
-        return {
-            "auth_bootstrap": True,
-            "read_only": False,
-            "show_api_keys": True,
-            "show_workers": True,
-            "show_log": True,
-            "show_cache": True,
-            "show_users_tab": True,
-            "dash_user": None,
-        }
     user = getattr(request.state, "dashboard_user", None)
     if user is None:
         return {
-            "auth_bootstrap": False,
             "read_only": True,
             "show_api_keys": False,
             "show_workers": False,
@@ -345,7 +336,6 @@ def template_auth_ctx(request: Request) -> dict[str, Any]:
         }
     adm = user.is_admin
     return {
-        "auth_bootstrap": False,
         "read_only": not adm,
         "show_api_keys": adm,
         "show_workers": adm,
@@ -359,6 +349,7 @@ def template_auth_ctx(request: Request) -> dict[str, Any]:
 def merge_dash_template_ctx(request: Request, ctx: dict[str, Any]) -> dict[str, Any]:
     merged = template_auth_ctx(request)
     merged.update(ctx)
+    merged["show_cache"] = merged["show_cache"] and deps.get_cache() is not None
     return merged
 
 
@@ -466,14 +457,33 @@ async def health():
     )
 
 
-def _set_session_cookie(resp: RedirectResponse, user_id: int, secret: str) -> None:
+def _cookie_secure(request: Request) -> bool:
+    """Mark cookies Secure when configured or when the browser used HTTPS.
+
+    A reverse proxy that terminates TLS says so with ``X-Forwarded-Proto``.
+    A client that fakes the header over plain HTTP only gets a cookie its
+    own browser will not send back.
+    """
+    if settings.dashboard_cookie_secure:
+        return True
+    return _external_origin(request)[0] == "https"
+
+
+def _set_session_cookie(
+    request: Request, resp: RedirectResponse, user: dict[str, Any], secret: str
+) -> None:
     resp.set_cookie(
         AUTH_COOKIE,
-        sign_session(user_id, secret),
+        sign_session(
+            user["id"],
+            secret,
+            version=user.get("session_version") or 0,
+            username=user["username"],
+        ),
         httponly=True,
         samesite="lax",
-        max_age=SESSION_MAX_AGE,
-        secure=settings.dashboard_cookie_secure,
+        max_age=session_max_age(user.get("auth_source") or "local"),
+        secure=_cookie_secure(request),
     )
 
 
@@ -490,7 +500,8 @@ async def login_page(request: Request):
     db = deps.get_db()
     cfg = oidc.current_config()
     users_exist = await db.count_dashboard_users() > 0
-    if not users_exist and not cfg.usable:
+    # With no accounts only an admin-group SSO sign-in can create the first.
+    if not users_exist and not (cfg.usable and cfg.admin_group):
         return RedirectResponse(url="/", status_code=302)
     err = request.query_params.get("error")
     next_url = _safe_next_url(request.query_params.get("next"))
@@ -522,8 +533,7 @@ async def login_submit(
     db = deps.get_db()
     if await db.count_dashboard_users() == 0:
         return RedirectResponse(url="/", status_code=302)
-    client_ip = request.client.host if request.client else "unknown"
-    retry_after = login_attempt_limiter.reserve(client_ip)
+    retry_after = login_attempt_limiter.reserve(client_ip(request))
     if retry_after:
         return PlainTextResponse(
             "Too many sign-in attempts. Please try again later.",
@@ -533,18 +543,22 @@ async def login_submit(
     try:
         un = normalize_username(username)
     except ValueError:
+        un = None
+    if un is None:
         return RedirectResponse(url="/login?error=invalid", status_code=303)
     row = await db.get_dashboard_user_by_username(un)
-    if (
-        not row
-        or row.get("auth_source", "local") != "local"
-        or not verify_password(password, row["password_hash"])
-    ):
+    if row and row.get("auth_source", "local") == "local":
+        # scrypt takes tens of milliseconds; keep it off the event loop.
+        ok = await asyncio.to_thread(verify_password, password, row["password_hash"])
+    else:
+        await asyncio.to_thread(burn_password_check, password)
+        ok = False
+    if not ok or row is None:
         return RedirectResponse(url="/login?error=invalid", status_code=303)
     await db.touch_dashboard_user_login(row["id"])
     secret = await deps.get_dashboard_session_secret()
     resp = RedirectResponse(url=_safe_next_url(next), status_code=303)
-    _set_session_cookie(resp, row["id"], secret)
+    _set_session_cookie(request, resp, row, secret)
     return resp
 
 
@@ -574,7 +588,7 @@ async def login_oidc_start(request: Request):
         samesite="lax",
         max_age=oidc.STATE_MAX_AGE,
         path="/login/oidc",
-        secure=settings.dashboard_cookie_secure,
+        secure=_cookie_secure(request),
     )
     return resp
 
@@ -598,13 +612,26 @@ async def login_oidc_callback(request: Request):
         level = logging.WARNING if exc.code in ("provider", "token") else logging.INFO
         logger.log(level, "OIDC sign-in failed: %s", exc)
         resp = RedirectResponse(url=f"/login?error=oidc_{exc.code}", status_code=303)
-        resp.delete_cookie(oidc.STATE_COOKIE, path="/login/oidc")
+        _clear_cookie(request, resp, oidc.STATE_COOKIE, path="/login/oidc")
         return resp
     invalidate_dashboard_user_count_cache()
     resp = RedirectResponse(url=_safe_next_url(next_url), status_code=303)
-    resp.delete_cookie(oidc.STATE_COOKIE, path="/login/oidc")
-    _set_session_cookie(resp, user["id"], secret)
+    _clear_cookie(request, resp, oidc.STATE_COOKIE, path="/login/oidc")
+    _set_session_cookie(request, resp, user, secret)
     return resp
+
+
+def _clear_cookie(
+    request: Request, resp: RedirectResponse, name: str, path: str = "/"
+) -> None:
+    """Expire a cookie with the attributes it was set with.
+
+    Browsers may ignore a deletion that lacks ``Secure`` for a cookie that
+    was set Secure, which would leave the session in place.
+    """
+    resp.delete_cookie(
+        name, path=path, secure=_cookie_secure(request), httponly=True, samesite="lax"
+    )
 
 
 @router.post("/logout")
@@ -621,19 +648,27 @@ async def logout_post(request: Request):
         except oidc.OIDCError as exc:
             logger.warning("OIDC logout at the provider skipped: %s", exc)
     resp = RedirectResponse(url=dest, status_code=303)
-    resp.delete_cookie(AUTH_COOKIE)
+    _clear_cookie(request, resp, AUTH_COOKIE)
     return resp
+
+
+@router.post("/logout/everywhere")
+async def logout_everywhere(request: Request):
+    """Sign the current user out of every browser, this one included."""
+    user = getattr(request.state, "dashboard_user", None)
+    if user is not None and user.id > 0:
+        await deps.get_db().bump_dashboard_user_session_version(user.id)
+        logger.info("Dashboard user %s signed out everywhere", user.username)
+    return await logout_post(request)
 
 
 @router.get("/users", response_class=HTMLResponse)
 async def users_page(request: Request):
     db = deps.get_db()
-    n = await db.count_dashboard_users()
-    bootstrap = getattr(request.state, "auth_bootstrap", False)
     user = getattr(request.state, "dashboard_user", None)
-    if n > 0 and not bootstrap and (not user or not user.is_admin):
+    if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Forbidden")
-    users = await db.list_dashboard_users() if n else []
+    users = await db.list_dashboard_users()
     mgmt_keys = await db.list_management_keys()
     now = time.time()
     for k in mgmt_keys:
@@ -649,15 +684,18 @@ async def users_page(request: Request):
             request,
             {
                 "dashboard_users": users,
-                "users_exist": n > 0,
+                "users_exist": bool(users),
                 "management_keys": mgmt_keys,
                 "management_privileges": management_keys.PRIVILEGES,
                 "oidc": cfg if cfg.enabled else None,
                 "oidc_problems": cfg.problems(),
+                "oidc_warnings": cfg.warnings() if cfg.usable else [],
                 "oidc_callback": oidc.redirect_uri(cfg, scheme, host),
                 "query_error": request.query_params.get("error"),
                 "query_created": request.query_params.get("created"),
                 "query_updated": request.query_params.get("updated"),
+                "query_approved": request.query_params.get("approved"),
+                "query_signed_out": request.query_params.get("signed_out"),
             },
         ),
     )
@@ -671,10 +709,8 @@ async def users_add(
     is_admin: str = Form("0"),
 ):
     db = deps.get_db()
-    n = await db.count_dashboard_users()
-    bootstrap = getattr(request.state, "auth_bootstrap", False)
     user = getattr(request.state, "dashboard_user", None)
-    if n > 0 and not bootstrap and (not user or not user.is_admin):
+    if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Forbidden")
     try:
         un = normalize_username(username)
@@ -685,8 +721,6 @@ async def users_add(
     if len(password) < 8:
         return RedirectResponse(url="/users?error=password", status_code=303)
     make_admin = is_admin in ("1", "on", "true", "yes")
-    if n == 0:
-        make_admin = True
     await db.create_dashboard_user(un, hash_password(password), make_admin)
     invalidate_dashboard_user_count_cache()
     return RedirectResponse(url="/users?created=1", status_code=303)
@@ -695,15 +729,16 @@ async def users_add(
 @router.post("/users/{user_id}/delete")
 async def users_delete(request: Request, user_id: int):
     db = deps.get_db()
-    n = await db.count_dashboard_users()
-    bootstrap = getattr(request.state, "auth_bootstrap", False)
     user = getattr(request.state, "dashboard_user", None)
-    if n > 0 and not bootstrap and (not user or not user.is_admin):
+    if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Forbidden")
     target = await db.get_dashboard_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    if target["is_admin"] and await db.count_dashboard_admins() <= 1:
+    # Pending admins can't use the dashboard, so they aren't counted and may
+    # always be removed.
+    usable_admin = target["is_admin"] and target.get("approved", True)
+    if usable_admin and await db.count_dashboard_admins() <= 1:
         return RedirectResponse(url="/users?error=last-admin", status_code=303)
     await db.delete_dashboard_user(user_id)
     invalidate_dashboard_user_count_cache()
@@ -717,10 +752,8 @@ async def users_set_password(
     new_password: str = Form(...),
 ):
     db = deps.get_db()
-    n = await db.count_dashboard_users()
-    bootstrap = getattr(request.state, "auth_bootstrap", False)
     user = getattr(request.state, "dashboard_user", None)
-    if n > 0 and not bootstrap and (not user or not user.is_admin):
+    if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Forbidden")
     target = await db.get_dashboard_user_by_id(user_id)
     if not target:
@@ -729,8 +762,49 @@ async def users_set_password(
         return RedirectResponse(url="/users?error=sso-password", status_code=303)
     if len(new_password) < 8:
         return RedirectResponse(url="/users?error=password", status_code=303)
+    # Ends every session of the account; an administrator changing their
+    # own password keeps this one.
     await db.update_dashboard_user_password(user_id, hash_password(new_password))
-    return RedirectResponse(url="/users?updated=1", status_code=303)
+    resp = RedirectResponse(url="/users?updated=1", status_code=303)
+    if user is not None and user.id == user_id:
+        row = await db.get_dashboard_user_by_id(user_id)
+        if row is not None:
+            secret = await deps.get_dashboard_session_secret()
+            _set_session_cookie(request, resp, row, secret)
+    return resp
+
+
+def _require_admin(request: Request) -> None:
+    user = getattr(request.state, "dashboard_user", None)
+    if not user or not user.is_admin:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@router.post("/users/{user_id}/approve")
+async def users_approve(request: Request, user_id: int):
+    """Let a single sign-on account that is waiting for approval in."""
+    _require_admin(request)
+    db = deps.get_db()
+    if not await db.approve_dashboard_user(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    logger.info("Dashboard user %d approved", user_id)
+    return RedirectResponse(url="/users?approved=1", status_code=303)
+
+
+@router.post("/users/{user_id}/sign-out")
+async def users_sign_out(request: Request, user_id: int):
+    """End every session of another account."""
+    _require_admin(request)
+    db = deps.get_db()
+    if await db.get_dashboard_user_by_id(user_id) is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.bump_dashboard_user_session_version(user_id)
+    user = getattr(request.state, "dashboard_user", None)
+    resp = RedirectResponse(url="/users?signed_out=1", status_code=303)
+    if user is not None and user.id == user_id:
+        resp = RedirectResponse(url="/login", status_code=303)
+        _clear_cookie(request, resp, AUTH_COOKIE)
+    return resp
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -904,7 +978,9 @@ async def dashboard(request: Request):
             request,
             {
                 "providers": infos,
-                "providers_seed": [_provider_status_payload(i) for i in infos],
+                "providers_seed": [
+                    _provider_status_payload(i, admin=not read_only) for i in infos
+                ],
                 "cloud_presets": [p.to_dict() for p in PRESETS],
                 "hf_models_dir": settings.hf_models_dir,
                 "models": all_models,
@@ -959,8 +1035,23 @@ async def dashboard(request: Request):
     )
 
 
-def _provider_status_payload(info: Any) -> dict[str, Any]:
-    """One provider as the dashboard sees it; shared by the page and /api/status."""
+# Shown instead of a provider address to users who are not administrators:
+# addresses reveal internal hosts and ports.
+REDACTED_ADDRESS = "(hidden)"
+
+
+def _redacted_worker(worker: dict[str, Any] | None) -> dict[str, Any] | None:
+    if worker is None:
+        return None
+    return {k: v for k, v in worker.items() if k != "remote_addr"}
+
+
+def _provider_status_payload(info: Any, *, admin: bool = True) -> dict[str, Any]:
+    """One provider as the dashboard sees it; shared by the page and /api/status.
+
+    For non-admins (*admin* false) address URLs and a worker's remote address
+    are hidden.
+    """
     return {
         "id": info.provider.id,
         "name": info.provider.name,
@@ -974,11 +1065,11 @@ def _provider_status_payload(info: Any) -> dict[str, Any]:
         "model_names": sorted({m.name for m in info.models}),
         "active_requests": info.active_requests,
         "hot_models": info.hot_models,
-        "worker": info.worker,
+        "worker": info.worker if admin else _redacted_worker(info.worker),
         "addresses": [
             {
                 "id": a.id,
-                "url": a.url,
+                "url": a.url if admin else REDACTED_ADDRESS,
                 "is_live": a.is_live,
                 "is_preferred": a.is_preferred,
             }
@@ -997,13 +1088,14 @@ async def api_status(request: Request):
     pm = deps.get_pm()
     db = deps.get_db()
     dash_user = getattr(request.state, "dashboard_user", None)
-    bootstrap = getattr(request.state, "auth_bootstrap", False)
-    admin_payload = bootstrap or (dash_user is not None and dash_user.is_admin)
+    admin_payload = dash_user is not None and dash_user.is_admin
     infos = await pm.list_provider_infos()
     all_models = await db.list_all_models()
     log_total = await db.count_request_logs() if admin_payload else 0
 
-    providers_data = [_provider_status_payload(info) for info in infos]
+    providers_data = [
+        _provider_status_payload(info, admin=admin_payload) for info in infos
+    ]
 
     active_pulls = {
         pid: {
@@ -1147,8 +1239,6 @@ def _tristate(value: Any) -> bool | None:
 
 
 def _is_admin(request: Request) -> bool:
-    if getattr(request.state, "auth_bootstrap", False):
-        return True
     user = getattr(request.state, "dashboard_user", None)
     return bool(user and user.is_admin)
 
@@ -1169,7 +1259,8 @@ async def api_explain_routing(request: Request):
     ``allow_fallback`` and ``session_affinity``, or ``key_id`` to use an API
     key's mode, fallback, session affinity setting and pins (admins only).
     ``session_id`` shows how a client sending that ``X-Session-ID`` would be
-    routed, including its current binding.
+    routed, including its current binding. Without ``key_id``, ``client_ip``
+    names the client address, which scopes anonymous sessions.
     """
     q = request.query_params
     model = (q.get("model") or "").strip()
@@ -1231,8 +1322,16 @@ async def api_explain_routing(request: Request):
             locality=_key_locality(q.get("locality")),
         )
     session_id = (q.get("session_id") or "").strip()
+    client = (q.get("client_ip") or "").strip() or None
+    if client is not None:
+        try:
+            client = str(ipaddress.ip_address(client))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="client_ip must be an IP address"
+            ) from exc
     session = (
-        session_key({"x-session-id": session_id}, {"model": model}, key_id)
+        session_key({"x-session-id": session_id}, {"model": model}, key_id, client)
         if session_id
         else None
     )
@@ -1425,19 +1524,46 @@ async def api_list_key_pins(key_id: int):
     return JSONResponse({"pins": pins})
 
 
+PIN_MODEL_NAME_MAX = 255
+
+
+def validate_pin_model_name(raw: object) -> str:
+    """Return a pinned route's model name, or raise 400.
+
+    The name is shown in the dashboard and used as a path segment, so it must
+    be printable (no control characters) and at most 255 characters.
+    """
+    name = str(raw or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="model_name is required")
+    if len(name) > PIN_MODEL_NAME_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"model_name must be at most {PIN_MODEL_NAME_MAX} characters",
+        )
+    if not name.isprintable():
+        raise HTTPException(status_code=400, detail="model_name must be printable text")
+    return name
+
+
 @router.post("/api/keys/{key_id}/pins")
 async def api_set_key_pin(key_id: int, request: Request):
     db = deps.get_db()
     if not await _api_key_exists(db, key_id):
         raise HTTPException(status_code=404, detail="API key not found")
     body = await request.json()
-    model_name = str(body.get("model_name") or "").strip()
     provider_id_raw = body.get("provider_id")
-    if not model_name or provider_id_raw is None:
+    if not body.get("model_name") or provider_id_raw is None:
         raise HTTPException(
             status_code=400, detail="model_name and provider_id are required"
         )
-    provider_id = int(provider_id_raw)
+    model_name = validate_pin_model_name(body.get("model_name"))
+    try:
+        provider_id = int(provider_id_raw)
+    except TypeError, ValueError:
+        raise HTTPException(
+            status_code=400, detail="provider_id must be an integer"
+        ) from None
     provider = await db.get_provider(provider_id)
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
@@ -1642,6 +1768,8 @@ async def add_provider(
             api_key_header=api_key_header or None,
             provider_settings=settings_ or None,
         )
+    except BlockedAddressError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("add_provider failed")
         raise HTTPException(status_code=400, detail="Could not add provider") from exc
@@ -1947,6 +2075,8 @@ async def add_address(
     pm = deps.get_pm()
     try:
         await pm.add_address(provider_id, url, is_preferred=bool(is_preferred))
+    except BlockedAddressError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("add_address failed (provider_id=%s)", provider_id)
         raise HTTPException(status_code=400, detail="Could not add address") from exc
@@ -1976,6 +2106,8 @@ async def save_provider_address(
             await pm.update_address(aid, url, is_preferred=pref)
     except HTTPException:
         raise
+    except BlockedAddressError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid address") from exc
     except Exception as exc:
@@ -1998,6 +2130,8 @@ async def edit_address(
     pm = deps.get_pm()
     try:
         await pm.update_address(address_id, url, is_preferred=bool(is_preferred))
+    except BlockedAddressError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception(
             "update_address failed (provider_id=%s address_id=%s)",
@@ -2066,9 +2200,7 @@ async def api_pull_model(request: Request):
 
     cache_url = _cache_registry_url()
     db = deps.get_db()
-    source_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
-        request.client.host if request.client else "unknown"
-    )
+    source_ip = client_ip(request)
 
     progress_lock = asyncio.Lock()
 
@@ -2107,8 +2239,11 @@ async def api_pull_model(request: Request):
 
 
 @router.get("/api/hf/env")
-async def api_hf_env():
-    """Hugging Face settings the hf CLI will see (secrets masked)."""
+async def api_hf_env(request: Request):
+    """Hugging Face settings the hf CLI will see (secrets masked). Admins only:
+    it shows the router's environment (proxies, paths)."""
+    if not _is_admin(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         hf_download.hf_executable()
         available = True
