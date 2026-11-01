@@ -245,10 +245,12 @@ curl http://localhost:8080/v1/systemone -H 'Content-Type: application/json' -d '
 
 `/v1/decisions` is the same API under a vendor-neutral name. Both routes are also served without `/v1`, and on the Ollama API port (11434) as well as 8080. Routing, API key policies, pins and fallbacks apply as for chat.
 
+A request may ask up to 8 questions about a state of up to 32,000 characters (`LLAMA_ROUTER_DECISION_MAX_QUESTIONS`, `LLAMA_ROUTER_DECISION_MAX_STATE_CHARS`); larger ones are refused with 400. Each question is a backend call that sends the whole state, so a key with a daily spend cap is refused with 429, before any call is made, when the request's estimated cost would take it past the cap.
+
 How a request is answered:
 
 - **Passed through.** If the provider serves either decision route upstream (its last probe found one, or it is TypeSafe's own API), the request goes there unchanged apart from the model name. The two routes take the same body, so a `/v1/decisions` request reaches an upstream that has only `/v1/systemone`.
-- **Emulated.** Otherwise each question becomes a one-token chat completion with logprobs, all sent to one provider at once. The answer is read from the probabilities of the option labels. llama.cpp, vLLM and most OpenAI-compatible servers support this.
+- **Emulated.** Otherwise each question becomes a one-token chat completion with logprobs, all sent to one provider, up to `LLAMA_ROUTER_DECISION_MAX_CONCURRENCY` (4) at once. The answer is read from the probabilities of the option labels. llama.cpp, vLLM and most OpenAI-compatible servers support this.
 - **No logprobs.** A provider that answers without logprobs isn't offered for decisions for an hour, and the request is routed once more.
 - **Workers.** A hub sends decisions to its workers the same way. A worker that relays its own router answers them there; an older worker that doesn't relay decision routes gets them emulated. See [docs/workers.md](docs/workers.md#decision-requests).
 
@@ -277,12 +279,12 @@ curl -X DELETE http://localhost/api/decisions/calibrations/1
 
 ### Decision policies per API key
 
-An API key can ask decision questions about each generation request before it is routed (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/api/chat`, `/api/generate`). The state is the request's user text: every user message, oldest first, or its prompt or input, up to the newest 16,000 characters. A request with no user text at all, such as images only, is passed without asking. Keys without a policy are routed exactly as before, with no extra round trip.
+An API key can ask decision questions about each generation request before it is routed (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/api/chat`, `/api/generate`). The state is the request's text: every message of any role (system, user, assistant, tool), oldest first, with non-user turns prefixed by their role, or its system prompt and prompt or input, up to the newest 16,000 characters. A request with no text at all, such as images only, is passed without asking. Keys without a policy are routed exactly as before, with no extra round trip.
 
 - **Tiered routing.** A `score` question, typically a difficulty rubric, and a model for each level. The most probable level picks the model the request is routed to. A level without a target, or `models` that leaves out the requested model, keeps the requested model.
 - **Gating.** `noul` questions with a threshold each. A request whose probability reaches a gate's threshold is rejected with 403, and the detail names the gate and the probability.
 
-The tier and gate questions go to the policy's decision model as one decision request, answered in parallel, routed and calibrated like any other. The policy never fails a request on its own account: if the decision model has no provider, errors or takes longer than `LLAMA_ROUTER_DECISION_POLICY_TIMEOUT_SECONDS`, the request goes on with the model it asked for and no gate, and the reason is logged. The decision call is logged on its own, and the request log entry of the request it served starts with what the policy did and how long it took, for example `policy 180ms, tier=2 auto->llama3.1:70b, injection=0.03`.
+The tier and gate questions go to the policy's decision model as one decision request, answered in parallel, routed and calibrated like any other. If the decision model has no provider, errors or takes longer than `LLAMA_ROUTER_DECISION_POLICY_TIMEOUT_SECONDS`, a policy with gates fails closed: the request is refused with 503, since the gates could not check it. Set `LLAMA_ROUTER_DECISION_POLICY_FAIL_OPEN=true` to let such requests through unchecked instead. A policy with only a tier goes on with the model the request asked for. Either way the reason is logged. The decision call is logged on its own, and the request log entry of the request it served starts with what the policy did and how long it took, for example `policy 180ms, tier=2 auto->llama3.1:70b, injection=0.03`.
 
 ```bash
 curl -X PUT http://localhost/api/keys/1/decision-policy -H 'Content-Type: application/json' -d '{
@@ -344,13 +346,13 @@ curl -X DELETE http://localhost/api/fallbacks/llama3:70b
 
 ## Cost
 
-The request log records each request's tokens in and out, the API key that made it, and its cost when the provider's price for the model is known. Tokens come from the response's `usage` (or Ollama's counts); a streamed OpenAI-style response carries usage only when the client sends `stream_options: {"include_usage": true}`.
+The request log records each request's tokens in and out, the API key that made it, and its cost when the provider's price for the model is known. Tokens come from the response's `usage` (or Ollama's counts); for a streamed `/v1/chat/completions` or `/v1/completions` request to a cloud provider the router asks for usage itself (`stream_options.include_usage`) and, if the client did not, keeps the extra usage-only event out of the stream it sends on. When a priced cloud model's response reports no usage at all, the request is charged an estimate: its prompt size plus its `max_tokens` (or `SPEND_ESTIMATE_COMPLETION_TOKENS`, 4096 by default, when it sets none).
 
 **Prices** are USD per million tokens, set per provider on its page: a model name, a pattern such as `gpt-4o*`, or `*` for every model. A price set by hand wins over one from the provider's own model list (OpenRouter lists one for every model). Local providers cost nothing unless priced; a cloud model with no price has an unknown cost.
 
 **Cheapest** routing ranks candidates by the price of a typical request (1,000 tokens in, 256 out), then by the balanced score. A cloud model with an unknown price comes last.
 
-**Daily spend caps.** An API key can have a cap in USD per UTC day. Once its logged spend reaches the cap, the key is limited to local providers until the next day; a cloud-only key is refused with HTTP 429. The key list shows each key's spend today.
+**Daily spend caps.** An API key can have a cap in USD per UTC day. Once its logged spend reaches the cap, the key is limited to local providers until the next day; a cloud-only key is refused with HTTP 429. While a request to a priced cloud model runs, its estimated cost is held against the cap, so requests sent at the same time cannot together run past it; a request whose estimate does not fit goes to a local provider (or is refused with 429). Once it finishes, the hold is replaced by the actual cost, or dropped if the request failed. A capped key cannot send image or audio requests to a cloud model with no price, since their cost could not be counted (HTTP 403 unless a local provider serves the model). The key list shows each key's spend today.
 
 **Usage by key and provider.** The Keys tab shows, for the last 24 hours, 7 days, 30 days or all time, how many requests each API key sent to each provider, how many failed, the tokens in and out, the cost and when the last one was. Requests without a key appear as *no key*. When a worker shares its providers one by one (see docs/workers.md), each of them shows up separately. Scripts can read the same report from `GET /api/keys/usage?period=7d` (`24h`, `7d`, `30d` or `all`; add `key_id=` for one key) with a dashboard sign-in or a management key with `keys:read`.
 
@@ -526,24 +528,29 @@ Then set:
 | `LLAMA_ROUTER_OIDC_CLIENT_SECRET` | empty | Client secret. |
 | `LLAMA_ROUTER_OIDC_ADMIN_GROUP` | empty | Members are administrators. |
 | `LLAMA_ROUTER_OIDC_ALLOWED_GROUP` | empty | If set, only members (and admins) may sign in. |
+| `LLAMA_ROUTER_OIDC_REQUIRE_APPROVAL` | `false` | New SSO accounts wait for an administrator to approve them on the **Users** page. |
 | `LLAMA_ROUTER_OIDC_GROUPS_CLAIM` | `groups` | Claim holding the groups. Dots reach nested claims. |
 | `LLAMA_ROUTER_OIDC_SCOPES` | `openid profile email groups` | Requested scopes. |
 | `LLAMA_ROUTER_OIDC_REDIRECT_BASE_URL` | empty | External dashboard URL, e.g. `https://llm.example.org`. Empty uses the request's host and `X-Forwarded-*` headers. |
 | `LLAMA_ROUTER_OIDC_DISPLAY_NAME` | `single sign-on` | Button text: "Sign in with ...". |
-| `LLAMA_ROUTER_OIDC_ONLY` | `false` | Hide the password form and refuse password sign-in. |
+| `LLAMA_ROUTER_OIDC_ONLY` | `false` | Hide the password form and refuse password sign-in. Ignored without an admin group, since only a local account could administer. |
 | `LLAMA_ROUTER_OIDC_LOGOUT_AT_IDP` | `false` | Also end the session at the provider on logout. |
 | `LLAMA_ROUTER_OIDC_ALLOW_INSECURE` | `false` | Allow an `http://` issuer, for local testing only. |
 
-Behind HTTPS, also set `LLAMA_ROUTER_DASHBOARD_COOKIE_SECURE=true`. The **Users** page shows the issuer, callback URL and group rules in effect, and marks SSO accounts.
+Session cookies are marked Secure when the request arrives over HTTPS or with `X-Forwarded-Proto: https` from a reverse proxy; set `LLAMA_ROUTER_DASHBOARD_COOKIE_SECURE=true` to always mark them. The **Users** page shows the issuer, callback URL and group rules in effect, and marks SSO accounts.
+
+Set at least one of `LLAMA_ROUTER_OIDC_ALLOWED_GROUP`, `LLAMA_ROUTER_OIDC_ADMIN_GROUP` or `LLAMA_ROUTER_OIDC_REQUIRE_APPROVAL`. With none of them, anyone your provider authenticates (for Google, any Google account) can use the dashboard; the router logs an error at startup and the **Users** page shows a warning.
 
 How accounts behave:
 
 - **First sign-in creates the account.** It is matched to the provider by issuer and subject, never by email, so SSO cannot take over a local account. If the username is taken, a number is appended.
-- **Roles follow the provider.** The admin flag is recomputed from the groups claim at every sign-in. A removed admin loses access at their next sign-in. Sessions last up to 14 days.
+- **Roles follow the provider.** The admin flag is recomputed from the groups claim at every sign-in; a change ends the account's other sessions. SSO sessions last up to 12 hours (local ones 14 days), so someone removed at the provider loses the dashboard within half a day.
+- **Approval.** With `LLAMA_ROUTER_OIDC_REQUIRE_APPROVAL`, a new SSO account is created as *Pending approval* and told so at sign-in; an administrator clicks **Approve** on the **Users** page. The very first account is approved automatically. Existing accounts are not affected.
 - **Groups.** If the ID token has no groups claim, the userinfo endpoint is asked.
 - **No passwords.** SSO accounts cannot use password sign-in and cannot be given a password.
+- **Signing out.** **Everywhere** next to **Log out** ends all of your sessions; **Sign out** on the **Users** page does it for another account. Changing a password does it too.
 - **Removing access.** Deleting an SSO account on the **Users** page signs it out, but the account is recreated at the person's next sign-in. To keep someone out, remove them at the provider or set `LLAMA_ROUTER_OIDC_ALLOWED_GROUP`.
-- **Bootstrap.** With no accounts at all, the dashboard is open as before. The first SSO sign-in creates the first account. If an admin group is set, that first person must be in it. Otherwise the first account is an administrator.
+- **First account.** With no accounts at all, the dashboard is locked. Create the first administrator with `LLAMA_ROUTER_ADMIN_USERNAME` and `LLAMA_ROUTER_ADMIN_PASSWORD`, or, if an admin group is set, by signing in through SSO as a member of it. Without an admin group SSO cannot create the first account, since whoever signed in first would own the router.
 - **Break-glass.** Keep one local administrator, or use the lockout steps above, in case the provider is unreachable.
 
 Provider notes:
@@ -552,7 +559,7 @@ Provider notes:
 - **Keycloak:** add a *Group Membership* mapper with "Full group path" off, or use realm roles with `LLAMA_ROUTER_OIDC_GROUPS_CLAIM=realm_access.roles`.
 - **Okta:** add a `groups` claim with a filter on the authorization server.
 - **Entra ID:** group claims carry object IDs, not names, so use the group's ID as the admin group. Users in many groups get an overage marker instead of a list, so app roles with `LLAMA_ROUTER_OIDC_GROUPS_CLAIM=roles` are more reliable.
-- **Google:** has no groups claim. Leave the admin group empty so the first account administers, and promote others by hand.
+- **Google:** has no groups claim. Leave the admin group empty, create the first administrator with `LLAMA_ROUTER_ADMIN_USERNAME` and `LLAMA_ROUTER_ADMIN_PASSWORD`, and promote others by hand.
 
 To try it locally, start the mock provider in `docker-compose.yaml`. It shows a form where you type any subject and claims, such as `{"preferred_username": "ada", "groups": ["router-admins"]}`:
 
@@ -644,7 +651,13 @@ curl http://localhost/v1/chat/completions -H 'API-KEY: lr_...' \
 
 A request goes to the API when its path and method match an API route; the rest goes to the dashboard. `GET /decisions` is the dashboard page and `POST /decisions` is the API. `/health` stays the dashboard's.
 
-API requests on the dashboard port are checked by API key, not by dashboard login. Anyone who can reach port 80 can reach the API, so require API keys (turn off unauthenticated access) before exposing it.
+API requests on the dashboard port are checked by API key, not by dashboard login. Anyone who can reach port 80 can reach the API, so require API keys (leave unauthenticated access off) before exposing it.
+
+### Requests without an API key
+
+New installs require an API key on every API request. **Accept requests without an API key** under *Authentication Policy* on the **API Keys** tab lets clients without one through; llama-router logs a warning at startup while it is on. A request that sends a key that is wrong, revoked or expired is always refused with 401, even then.
+
+Routers that were already set up keep the setting they had: earlier versions accepted requests without a key by default, and upgrading does not change a router that already has providers, API keys or dashboard accounts. Check the setting after upgrading if you meant to require keys.
 
 ### Migrating data from SQLite to PostgreSQL
 
@@ -680,7 +693,9 @@ Set `LLAMA_ROUTER_CACHE_EXTERNAL_HOST` to the host or IP your Ollama backends re
 
 #### Requirements
 
-- The cache runs as an HTTP server on port 9200 (configurable). This port does **not** need to be exposed externally — it only needs to be reachable from the Ollama backends on your LAN.
+- The cache runs as an HTTP server on port 9200 (configurable). It has no authentication of its own, so by default it binds `127.0.0.1` and `docker-compose.prod.yaml` does not publish the port. To serve Ollama backends on your LAN, set `LLAMA_ROUTER_CACHE_HOST=0.0.0.0`, publish `9200:9200` (for example in a `docker-compose.override.yaml`) and firewall it to the LAN; never expose it to the internet. `LLAMA_ROUTER_CACHE_TOKEN` can require a bearer token, but stock Ollama cannot send one, so it only helps behind a reverse proxy that adds the header.
+- Every blob is checked against its sha256 digest while it downloads and discarded on a mismatch. `LLAMA_ROUTER_CACHE_MAX_BYTES` caps the blob store, evicting least recently used blobs.
+- Manifests are stored as `manifests/<name>/_refs/<tag>` (for example `manifests/library/llama3.2/_refs/latest`). Older versions used a flat `library_llama3.2` directory; `library/` manifests are moved over at startup, others are dropped and fetched again on the next pull. Blobs are kept.
 - In Docker, the cache directory should be on a persistent volume with enough space for the models you pull (models range from ~2 GB to ~200+ GB).
 
 #### Disabling the cache
@@ -705,12 +720,22 @@ The released image is on `ghcr.io/romkey/llama-router`. Copy [`docker-compose.pr
 docker compose -f docker-compose.prod.yaml up -d
 ```
 
-Open http://localhost to access the dashboard and add your backends. The database, the registry cache and Hugging Face downloads live on the `llama-router-data` volume at `/app/data`. Set `APP_VERSION=0.21.0` to pin a release instead of `latest`.
+Before the first start, set `LLAMA_ROUTER_ADMIN_USERNAME` and `LLAMA_ROUTER_ADMIN_PASSWORD` (at least 8 characters) in `.env`: llama-router creates that administrator at startup when there are no dashboard accounts yet. There is no way to create the first account from the web; until one exists the dashboard only shows a page asking for these variables. Once any account exists they are ignored, so you can remove them.
+
+Open http://localhost, sign in and add your backends. The database, the registry cache and Hugging Face downloads live on the `llama-router-data` volume at `/app/data`. Set `APP_VERSION=0.21.0` to pin a release instead of `latest`.
 
 The container runs as user 10001 with a read-only root filesystem and no capabilities. A data volume created by an image older than 0.22 is owned by root; give it to the new user once:
 
 ```bash
 docker compose -f docker-compose.prod.yaml run --rm --user root llama-router chown -R 10001:10001 /app/data
+```
+
+Release images after 0.26.1 are signed with [cosign](https://docs.sigstore.dev/) keyless signing by the release workflow. To check one before running it:
+
+```bash
+cosign verify ghcr.io/romkey/llama-router:latest \
+  --certificate-identity-regexp '^https://github.com/romkey/llama-router/\.github/workflows/release\.yaml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
 ### With pip
@@ -726,7 +751,7 @@ Add `[postgres]` or `[mysql]` for those databases (the Docker image already incl
 
 ### Dashboard login lockout (forgot password)
 
-After you create at least one account under **Users**, the dashboard requires sign-in. Passwords are stored hashed; they cannot be read back. If you lose the password, clear the dashboard user table and start over (you will briefly have an open dashboard until you create a new user).
+The dashboard always requires sign-in. Passwords are stored hashed; they cannot be read back. After five failed password sign-ins in a row, from one address or for one username, further attempts get HTTP 429 for a delay that doubles with each failure, up to five minutes; a restart clears it. If you lose the password, clear the dashboard user table and restart with `LLAMA_ROUTER_ADMIN_USERNAME` and `LLAMA_ROUTER_ADMIN_PASSWORD` set; the new administrator is created at startup. The dashboard stays locked while there are no accounts.
 
 **Docker Compose** (the image keeps the database at `/app/data/llama_router.db`; with the development setup, drop `-f docker-compose.prod.yaml`):
 
@@ -735,7 +760,7 @@ docker compose -f docker-compose.prod.yaml exec llama-router python -c "import s
 docker compose -f docker-compose.prod.yaml restart llama-router
 ```
 
-The first command removes **all** dashboard accounts. The restart clears the in-process user-count cache so the UI immediately returns to bootstrap mode (no login required). Then open **Users** and create a new administrator.
+The first command removes **all** dashboard accounts. Set `LLAMA_ROUTER_ADMIN_USERNAME` and `LLAMA_ROUTER_ADMIN_PASSWORD` in `.env` before the restart, which creates the new administrator.
 
 If you set `LLAMA_ROUTER_DATABASE_PATH` to something else, use that path inside the `sqlite3.connect(...)` call. For a local SQLite file (no Docker), run the same `DELETE FROM dashboard_users` against your database file with any SQLite client.
 
@@ -748,19 +773,15 @@ docker compose -f docker-compose.prod.yaml restart llama-router
 
 ### Debugging from inside the container
 
-The image includes basic network tools so you can check reachability from the
-router's own point of view, which is often different from your laptop's:
+The production image carries no network tools (no ping, dig, nc, curl or wget), to keep its attack surface small. Python is there, so a quick check of whether the router can reach a backend works:
 
 ```bash
-docker compose -f docker-compose.prod.yaml exec llama-router ping -c 3 192.168.1.100
-docker compose -f docker-compose.prod.yaml exec llama-router host gpu-server.local
-docker compose -f docker-compose.prod.yaml exec llama-router dig +short gpu-server.local
-docker compose -f docker-compose.prod.yaml exec llama-router nc -zv 192.168.1.100 11434
-docker compose -f docker-compose.prod.yaml exec llama-router curl -s http://192.168.1.100:11434/api/version
-docker compose -f docker-compose.prod.yaml exec llama-router wget -qO- http://192.168.1.100:8080/health
-docker compose -f docker-compose.prod.yaml exec llama-router ip route
-docker compose -f docker-compose.prod.yaml exec llama-router traceroute 192.168.1.100
+docker compose -f docker-compose.prod.yaml exec llama-router python -c "import socket; print(socket.getaddrinfo('gpu-server.local', None)[0][4])"
+docker compose -f docker-compose.prod.yaml exec llama-router python -c "import socket; socket.create_connection(('192.168.1.100', 11434), timeout=3); print('open')"
+docker compose -f docker-compose.prod.yaml exec llama-router python -c "import urllib.request; print(urllib.request.urlopen('http://192.168.1.100:11434/api/version', timeout=3).read().decode())"
 ```
+
+For anything more, attach a throwaway debugging container to the router's network namespace, e.g. `docker run --rm -it --network container:<router-container> nicolaka/netshoot`. The development image (`docker compose up`) still includes ping, dig, nc, curl, wget, ip and traceroute.
 
 ## Development
 
