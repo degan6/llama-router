@@ -7,6 +7,11 @@ described in their git tags and GitHub Releases.
 
 ## [Unreleased]
 
+### Added
+
+- Dashboard password sign-in now limits attempts by account and client address,
+  returning HTTP 429 with `Retry-After` during the configurable cooldown.
+
 ## [0.26.1] - 2026-10-31
 
 ### Fixed

@@ -57,10 +57,17 @@ from .auth_core import (
     sign_session,
     verify_password,
 )
+from .login_limits import LoginAttemptLimiter
 from .middleware import invalidate_dashboard_user_count_cache
 from .model_groups import group_rows
 
 logger = logging.getLogger(__name__)
+
+login_attempt_limiter = LoginAttemptLimiter(
+    account_attempts=settings.dashboard_login_account_attempts,
+    ip_attempts=settings.dashboard_login_ip_attempts,
+    window_seconds=settings.dashboard_login_window_seconds,
+)
 
 _active_pulls: dict[str, dict] = {}
 _active_benchmarks: dict[str, dict] = {}
@@ -519,6 +526,16 @@ async def login_submit(
     try:
         un = normalize_username(username)
     except ValueError:
+        un = None
+    client_ip = request.client.host if request.client else "unknown"
+    retry_after = login_attempt_limiter.reserve(client_ip, un)
+    if retry_after:
+        return PlainTextResponse(
+            "Too many sign-in attempts. Please try again later.",
+            status_code=429,
+            headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+        )
+    if un is None:
         return RedirectResponse(url="/login?error=invalid", status_code=303)
     row = await db.get_dashboard_user_by_username(un)
     if (

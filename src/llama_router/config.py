@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 from sqlalchemy.engine import make_url
 from sqlalchemy.engine.url import URL
@@ -99,6 +100,9 @@ class Settings(BaseSettings):
     session_secret: str = ""
     # Set true behind HTTPS so session cookies are only sent over TLS.
     dashboard_cookie_secure: bool = False
+    dashboard_login_account_attempts: int = Field(default=5, ge=1)
+    dashboard_login_ip_attempts: int = Field(default=20, ge=1)
+    dashboard_login_window_seconds: int = Field(default=300, ge=1)
     # OpenID Connect sign-in for the dashboard. An empty issuer turns it off.
     oidc_issuer: str = ""
     oidc_client_id: str = ""

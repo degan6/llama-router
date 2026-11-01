@@ -14,8 +14,10 @@ from httpx import ASGITransport, AsyncClient
 from llama_router import request_logger
 from llama_router.config import Settings, settings
 from llama_router.dashboard import deps as dash_deps
+from llama_router.dashboard import routes as dash_routes
 from llama_router.dashboard.app import app as dashboard_app
 from llama_router.dashboard.decisions import router as dash_decisions_router
+from llama_router.dashboard.login_limits import LoginAttemptLimiter
 from llama_router.dashboard.middleware import invalidate_dashboard_user_count_cache
 from llama_router.database import Database
 from llama_router.llamacpp_api import deps
@@ -68,6 +70,7 @@ async def dash_client(
         settings, "session_secret", "test-session-secret-key-min-16chars"
     )
     monkeypatch.setattr(settings, "dashboard_cookie_secure", False)
+    monkeypatch.setattr(dash_routes, "login_attempt_limiter", LoginAttemptLimiter())
 
     db = Database(str(tmp_path / "dash_auth.db"))
     await db.connect()

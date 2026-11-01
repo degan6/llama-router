@@ -36,10 +36,27 @@ SQLite is the default and fits a single router. To move to PostgreSQL, see
 
 ## Dashboard sign-in
 
+Password sign-in limits all attempts (including successful ones) by normalized
+account and client address in fixed windows, starting with the first attempt.
+Exhausted limits return HTTP 429 with `Retry-After` in seconds; blocked requests
+do not extend the window. Unknown accounts receive the same limits. Counters
+are in memory per process and reset on restart. The store holds at most 10,000
+active account/address entries; when full, new entries are refused until space
+expires. Existing sessions and OIDC sign-in are unaffected.
+
+Client addresses come from the ASGI server, never directly from request headers.
+Behind a proxy, configure Uvicorn to trust forwarded addresses only from your
+proxy; otherwise clients share the proxy address limit. Multiple router
+processes need a shared limit at the reverse proxy for a deployment-wide bound.
+
+
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `SESSION_SECRET` | *(empty)* | Secret for signing session cookies. Empty: a random one is generated and kept in the database |
 | `DASHBOARD_COOKIE_SECURE` | `false` | Send session cookies over HTTPS only. Set `true` behind TLS |
+| `DASHBOARD_LOGIN_ACCOUNT_ATTEMPTS` | `5` | Password attempts per normalized account per window; integer >= 1 |
+| `DASHBOARD_LOGIN_IP_ATTEMPTS` | `20` | Password attempts per client address per window; integer >= 1 |
+| `DASHBOARD_LOGIN_WINDOW_SECONDS` | `300` | Fixed password-attempt window in seconds; integer >= 1 |
 | `OIDC_ISSUER` | *(empty)* | OpenID Connect issuer URL. Empty turns single sign-on off |
 | `OIDC_CLIENT_ID` | *(empty)* | Client ID |
 | `OIDC_CLIENT_SECRET` | *(empty)* | Client secret |
