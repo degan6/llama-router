@@ -26,27 +26,22 @@ class LoginAttemptLimiter:
     def __init__(
         self,
         *,
-        account_attempts: int = 30,
         ip_attempts: int = 120,
         window_seconds: int = 300,
         max_entries: int = 10_000,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if min(account_attempts, ip_attempts, window_seconds) < 1 or max_entries < 2:
-            raise ValueError(
-                "Login limits must be positive and max_entries at least two"
-            )
-        self._account_attempts = account_attempts
+        if min(ip_attempts, window_seconds, max_entries) < 1:
+            raise ValueError("Login limits and max_entries must be positive")
         self._ip_attempts = ip_attempts
         self._window_seconds = window_seconds
         self._max_entries = max_entries
         self._clock = clock
-        self._windows: OrderedDict[tuple[str, str], _Window] = OrderedDict()
+        self._windows: OrderedDict[str, _Window] = OrderedDict()
 
-    def reserve(self, client_ip: str, username: str | None) -> int:
-        """Count an attempt, or return seconds until it can be retried.
+    def reserve(self, client_ip: str) -> int:
+        """Count an attempt and return zero, or return retry seconds if blocked.
 
-        ``username`` must already be normalized, or None for malformed input.
         Entries expire in insertion order because all use the same duration.
         """
         now = self._clock()
@@ -55,21 +50,14 @@ class LoginAttemptLimiter:
             if first.expires > now:
                 break
             self._windows.popitem(last=False)
-        limits = [(("ip", client_ip), self._ip_attempts)]
-        if username is not None:
-            limits.append((("account", username), self._account_attempts))
-        blocked = [
-            window.expires
-            for key, limit in limits
-            if (window := self._windows.get(key)) and window.attempts >= limit
-        ]
-        if blocked:
-            return max(1, math.ceil(max(blocked) - now))
-        missing = sum(key not in self._windows for key, _ in limits)
-        if len(self._windows) + missing > self._max_entries:
-            return max(1, math.ceil(next(iter(self._windows.values())).expires - now))
-        for key, _ in limits:
-            if key not in self._windows:
-                self._windows[key] = _Window(now + self._window_seconds)
-            self._windows[key].attempts += 1
+        window = self._windows.get(client_ip)
+        if window is None:
+            if len(self._windows) >= self._max_entries:
+                first = next(iter(self._windows.values()))
+                return max(1, math.ceil(first.expires - now))
+            window = _Window(now + self._window_seconds)
+            self._windows[client_ip] = window
+        if window.attempts >= self._ip_attempts:
+            return max(1, math.ceil(window.expires - now))
+        window.attempts += 1
         return 0

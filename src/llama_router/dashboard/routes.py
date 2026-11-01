@@ -64,7 +64,6 @@ from .model_groups import group_rows
 logger = logging.getLogger(__name__)
 
 login_attempt_limiter = LoginAttemptLimiter(
-    account_attempts=settings.dashboard_login_account_attempts,
     ip_attempts=settings.dashboard_login_ip_attempts,
     window_seconds=settings.dashboard_login_window_seconds,
 )
@@ -523,19 +522,17 @@ async def login_submit(
     db = deps.get_db()
     if await db.count_dashboard_users() == 0:
         return RedirectResponse(url="/", status_code=302)
-    try:
-        un = normalize_username(username)
-    except ValueError:
-        un = None
     client_ip = request.client.host if request.client else "unknown"
-    retry_after = login_attempt_limiter.reserve(client_ip, un)
+    retry_after = login_attempt_limiter.reserve(client_ip)
     if retry_after:
         return PlainTextResponse(
             "Too many sign-in attempts. Please try again later.",
             status_code=429,
             headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
         )
-    if un is None:
+    try:
+        un = normalize_username(username)
+    except ValueError:
         return RedirectResponse(url="/login?error=invalid", status_code=303)
     row = await db.get_dashboard_user_by_username(un)
     if (

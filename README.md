@@ -509,10 +509,9 @@ Each provider can also carry extra headers (one `Name: value` per line) and mode
 
 ## Single sign-on (OpenID Connect)
 
-Local password sign-in limits attempts per account and client address, returning
-HTTP 429 with a retry delay when exhausted. Defaults are 30 attempts per
-account and 120 per address within five minutes, including successful
-sign-ins. See [dashboard sign-in configuration](docs/configuration.md#dashboard-sign-in)
+Local password sign-in allows 120 attempts per client IP address within five
+minutes by default, including successful sign-ins. Exhausted limits return
+HTTP 429 with a retry delay. See [dashboard sign-in configuration](docs/configuration.md#dashboard-sign-in)
 for settings and proxy/multiple-process deployment details.
 
 The dashboard can sign people in through an OpenID Connect provider such as Authentik, Keycloak, Okta, Entra ID or dex. Members of an admin group become administrators. Everyone else who signs in is a read-only viewer who may chat and [issue themselves API keys](#keys-users-issue-themselves). Local accounts keep working alongside SSO unless you turn password sign-in off.

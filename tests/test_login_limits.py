@@ -10,56 +10,55 @@ from pydantic import ValidationError
 
 from llama_router.config import Settings
 from llama_router.dashboard import routes
+from llama_router.dashboard.app import app as dashboard_app
 from llama_router.dashboard.auth_core import AUTH_COOKIE, hash_password
 from llama_router.dashboard.login_limits import LoginAttemptLimiter
 from llama_router.database import Database
 
 
-def test_too_small_store_is_rejected() -> None:
-    with pytest.raises(ValueError, match="max_entries"):
-        LoginAttemptLimiter(max_entries=1)
+@pytest.mark.parametrize(
+    ("ip_attempts", "window_seconds", "max_entries"),
+    [(0, 300, 10_000), (120, 0, 10_000), (120, 300, 0)],
+)
+def test_nonpositive_limits_are_rejected(
+    ip_attempts: int, window_seconds: int, max_entries: int
+) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        LoginAttemptLimiter(
+            ip_attempts=ip_attempts,
+            window_seconds=window_seconds,
+            max_entries=max_entries,
+        )
 
 
-def test_account_limit_spans_client_addresses_and_expires() -> None:
+def test_address_limit_expires_without_extending_on_blocked_attempts() -> None:
     now = [100.0]
-    limiter = LoginAttemptLimiter(account_attempts=5, clock=lambda: now[0])
-    for i in range(5):
-        assert limiter.reserve(f"client-{i}", "alice") == 0
-    assert limiter.reserve("another-client", "alice") == 300
+    limiter = LoginAttemptLimiter(ip_attempts=5, clock=lambda: now[0])
+    for _ in range(5):
+        assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 300
+    assert limiter.reserve("two") == 0
     now[0] += 299.1
-    assert limiter.reserve("another-client", "alice") == 1
+    assert limiter.reserve("one") == 1
     now[0] += 0.9
-    assert limiter.reserve("another-client", "alice") == 0
-
-
-def test_address_limit_spans_accounts_and_invalid_usernames() -> None:
-    limiter = LoginAttemptLimiter(ip_attempts=3)
-    assert limiter.reserve("one", "alice") == 0
-    assert limiter.reserve("one", "bob") == 0
-    assert limiter.reserve("one", None) == 0
-    assert limiter.reserve("one", "carol") > 0
-    assert limiter.reserve("two", "carol") == 0
+    assert limiter.reserve("one") == 0
 
 
 def test_capacity_does_not_evict_active_limits_and_recovers() -> None:
     now = [0.0]
-    limiter = LoginAttemptLimiter(
-        account_attempts=5, max_entries=2, clock=lambda: now[0]
-    )
-    assert limiter.reserve("one", "alice") == 0
-    assert limiter.reserve("two", "bob") == 300
-    # Existing keys still have their original budget.
+    limiter = LoginAttemptLimiter(ip_attempts=5, max_entries=1, clock=lambda: now[0])
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("two") == 300
     for _ in range(4):
-        assert limiter.reserve("one", "alice") == 0
-    assert limiter.reserve("one", "alice") == 300
+        assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 300
     now[0] = 300
-    assert limiter.reserve("two", "bob") == 0
+    assert limiter.reserve("two") == 0
 
 
 @pytest.mark.parametrize(
     "name",
     [
-        "dashboard_login_account_attempts",
         "dashboard_login_ip_attempts",
         "dashboard_login_window_seconds",
     ],
@@ -78,6 +77,9 @@ async def test_concurrent_attempts_reserve_before_credential_lookup(
 ) -> None:
     client, db = dash_client
     await db.create_dashboard_user("alice", hash_password("right-password"), True)
+    monkeypatch.setattr(
+        routes, "login_attempt_limiter", LoginAttemptLimiter(ip_attempts=5)
+    )
     calls = 0
 
     def verify(password: str, stored: str | None) -> bool:
@@ -89,12 +91,12 @@ async def test_concurrent_attempts_reserve_before_credential_lookup(
     responses = await asyncio.gather(
         *(
             client.post("/login", data={"username": "alice", "password": "bad"})
-            for _ in range(35)
+            for _ in range(10)
         )
     )
-    assert sum(r.status_code == 303 for r in responses) == 30
+    assert sum(r.status_code == 303 for r in responses) == 5
     assert sum(r.status_code == 429 for r in responses) == 5
-    assert calls == 30
+    assert calls == 5
     for response in responses:
         if response.status_code == 429:
             assert 1 <= int(response.headers["Retry-After"]) <= 300
@@ -117,14 +119,13 @@ async def test_login_limits_and_cooldown(
         "login_attempt_limiter",
         LoginAttemptLimiter(ip_attempts=5, clock=lambda: now[0]),
     )
-    for _ in range(5):
+    for attempt in range(5):
         response = await client.post(
-            "/login", data={"username": username, "password": "bad"}
+            "/login",
+            data={"username": username if attempt % 2 else "bob", "password": "bad"},
         )
         assert response.status_code == 303
         assert response.headers["location"] == "/login?error=invalid"
-    # Changing username case/whitespace and spoofing forwarded headers cannot
-    # bypass either budget. Correct credentials are also blocked until expiry.
     response = await client.post(
         "/login",
         data={"username": " ALICE ", "password": "right-password"},
@@ -142,13 +143,13 @@ async def test_login_limits_and_cooldown(
 
 
 @pytest.mark.asyncio
-async def test_successful_signins_do_not_reset_attempt_budgets(
+async def test_successful_signins_count_toward_address_limit(
     dash_client: tuple[httpx.AsyncClient, Database], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client, db = dash_client
     await db.create_dashboard_user("alice", hash_password("right-password"), True)
     monkeypatch.setattr(
-        routes, "login_attempt_limiter", LoginAttemptLimiter(account_attempts=1)
+        routes, "login_attempt_limiter", LoginAttemptLimiter(ip_attempts=1)
     )
     response = await client.post(
         "/login", data={"username": "alice", "password": "right-password"}
@@ -159,3 +160,31 @@ async def test_successful_signins_do_not_reset_attempt_budgets(
     )
     assert response.status_code == 429
     assert (await client.get("/")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_same_account_can_sign_in_from_another_address(
+    dash_client: tuple[httpx.AsyncClient, Database], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, db = dash_client
+    await db.create_dashboard_user("alice", hash_password("right-password"), True)
+    monkeypatch.setattr(
+        routes, "login_attempt_limiter", LoginAttemptLimiter(ip_attempts=1)
+    )
+    response = await client.post(
+        "/login", data={"username": "alice", "password": "bad"}
+    )
+    assert response.status_code == 303
+    response = await client.post(
+        "/login", data={"username": "alice", "password": "right-password"}
+    )
+    assert response.status_code == 429
+    transport = httpx.ASGITransport(app=dashboard_app, client=("192.0.2.1", 12345))
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as other:
+        response = await other.post(
+            "/login", data={"username": "alice", "password": "right-password"}
+        )
+    assert response.status_code == 303
+    assert AUTH_COOKIE in response.cookies
