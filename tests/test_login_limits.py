@@ -48,12 +48,99 @@ def test_capacity_does_not_evict_active_limits_and_recovers() -> None:
     now = [0.0]
     limiter = LoginAttemptLimiter(ip_attempts=5, max_entries=1, clock=lambda: now[0])
     assert limiter.reserve("one") == 0
-    assert limiter.reserve("two") == 300
+    assert limiter.reserve("two") == 3600
     for _ in range(4):
         assert limiter.reserve("one") == 0
     assert limiter.reserve("one") == 300
     now[0] = 300
+    assert limiter.reserve("two") == 3600
+    now[0] = 3900
     assert limiter.reserve("two") == 0
+
+
+def test_full_cooldown_starts_when_limit_is_hit() -> None:
+    now = [0.0]
+    limiter = LoginAttemptLimiter(ip_attempts=1, clock=lambda: now[0])
+    assert limiter.reserve("one") == 0
+    now[0] = 299
+    assert limiter.reserve("one") == 300
+    now[0] = 300
+    assert limiter.reserve("one") == 299
+    now[0] = 599
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 600
+
+
+def test_idle_reset_preserves_longer_attempt_windows() -> None:
+    now = [0.0]
+    limiter = LoginAttemptLimiter(
+        ip_attempts=1, window_seconds=7200, max_entries=1, clock=lambda: now[0]
+    )
+    assert limiter.reserve("one") == 0
+    now[0] = 3600
+    assert limiter.reserve("two") == 3600
+    assert limiter.reserve("one") == 3600
+    now[0] = 7200
+    assert limiter.reserve("one") == 0
+
+
+def test_repeated_cooldowns_double_and_cap_at_one_hour() -> None:
+    now = [0.0]
+    limiter = LoginAttemptLimiter(ip_attempts=1, clock=lambda: now[0])
+    for cooldown in [300, 600, 1200, 2400, 3600, 3600]:
+        assert limiter.reserve("one") == 0
+        assert limiter.reserve("one") == cooldown
+        now[0] += cooldown - 0.5
+        assert limiter.reserve("one") == 1
+        now[0] += 0.5
+
+
+def test_escalation_resets_after_one_idle_hour_following_cooldown() -> None:
+    now = [0.0]
+    limiter = LoginAttemptLimiter(ip_attempts=1, clock=lambda: now[0])
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 300
+    now[0] = 300 + 3600
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 300
+
+
+def test_new_attempts_restart_the_idle_reset_timer() -> None:
+    now = [0.0]
+    limiter = LoginAttemptLimiter(ip_attempts=1, clock=lambda: now[0])
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 300
+    now[0] = 300 + 3599
+    assert limiter.reserve("one") == 0
+    now[0] += 1
+    assert limiter.reserve("one") == 600
+
+
+def test_attempt_window_can_expire_without_resetting_escalation() -> None:
+    now = [0.0]
+    limiter = LoginAttemptLimiter(ip_attempts=1, clock=lambda: now[0])
+    assert limiter.reserve("one") == 0
+    now[0] = 300
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 300
+    now[0] = 600
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 600
+
+
+def test_capacity_cleanup_uses_idle_expiry_instead_of_insertion_order() -> None:
+    now = [0.0]
+    limiter = LoginAttemptLimiter(ip_attempts=1, max_entries=2, clock=lambda: now[0])
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 300
+    now[0] = 10
+    assert limiter.reserve("two") == 0
+    now[0] = 20
+    assert limiter.reserve("three") == 3590
+    now[0] = 3610
+    assert limiter.reserve("three") == 0
+    assert limiter.reserve("one") == 0
+    assert limiter.reserve("one") == 600
 
 
 @pytest.mark.parametrize(
@@ -140,6 +227,17 @@ async def test_login_limits_and_cooldown(
     )
     assert response.status_code == 303
     assert AUTH_COOKIE in response.cookies
+    for _ in range(4):
+        response = await client.post(
+            "/login", data={"username": username, "password": "bad"}
+        )
+        assert response.status_code == 303
+    response = await client.post(
+        "/login", data={"username": "alice", "password": "right-password"}
+    )
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "600"
+    assert AUTH_COOKIE not in response.cookies
 
 
 @pytest.mark.asyncio

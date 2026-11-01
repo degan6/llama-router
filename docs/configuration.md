@@ -36,15 +36,24 @@ SQLite is the default and fits a single router. To move to PostgreSQL, see
 
 ## Dashboard sign-in
 
-Password sign-in limits all attempts (including successful ones) by client IP
-address in fixed windows, starting with the first attempt.
-Exhausted limits return HTTP 429 with `Retry-After` in seconds; blocked requests
-do not extend the window. All usernames from one address share the same limit,
-including unknown or malformed usernames. Different addresses have independent
-limits, even for the same account. Counters are in memory per process and reset
-on restart. The store holds at most 10,000 active addresses; when full, new
-addresses are refused until space expires. Existing sessions and OIDC sign-in
-are unaffected.
+Password sign-in allows 120 attempts per client IP address in a five-minute
+window by default, including successful attempts. All usernames from one
+address share a budget, including unknown or malformed usernames. Different
+addresses have independent budgets, even for the same account.
+
+The first request over budget starts a full cooldown: five minutes, then ten,
+twenty, forty, and at most sixty minutes on repeated limit hits. The initial
+cooldown uses `DASHBOARD_LOGIN_WINDOW_SECONDS`, capped at one hour; later
+cooldowns double up to that cap. Blocked requests return HTTP 429 with
+`Retry-After` in seconds and do not extend or escalate the cooldown. Once it
+ends, the next attempt starts a fresh budget. One hour without login attempts
+after the cooldown resets escalation. Successful sign-ins count as attempts
+and do not reset escalation. Existing sessions and OIDC sign-in are unaffected.
+
+Counters are in memory per process and reset on restart. The store retains at
+most 10,000 addresses until their attempt window and idle reset have expired;
+when full, new addresses receive 429 until a retained address expires. Active entries are never evicted to
+admit a new address.
 
 Client addresses use `TRUSTED_PROXIES`: forwarded addresses are accepted only
 from configured proxy IPs or CIDRs. Without that setting clients share the
@@ -55,7 +64,7 @@ shared limit at the reverse proxy for a deployment-wide bound.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `DASHBOARD_LOGIN_IP_ATTEMPTS` | `120` | Password attempts per client address per window; integer >= 1 |
-| `DASHBOARD_LOGIN_WINDOW_SECONDS` | `300` | Fixed password-attempt window in seconds; integer >= 1 |
+| `DASHBOARD_LOGIN_WINDOW_SECONDS` | `300` | Password-attempt window and initial cooldown in seconds (cooldown capped at 3600); integer >= 1 |
 | `SESSION_SECRET` | *(empty)* | Secret for signing session cookies, encrypting stored provider keys and the worker hub token, and peppering client API key hashes. Empty: cookies use a random secret kept in the database; the rest use a random secret kept in `SECRET_KEY_PATH` |
 | `SECRET_KEY_PATH` | *(empty)* | File holding the generated secret when `SESSION_SECRET` is empty, created with mode 0600 and never stored in the database. Empty: `secret.key` beside the SQLite database (`/app/data/secret.key` in the Docker image). Back it up with the database: without it stored provider keys must be entered again and client API keys reissued |
 | `DASHBOARD_COOKIE_SECURE` | `false` | Always send session cookies over HTTPS only. Without it they are Secure whenever the request came over HTTPS or with `X-Forwarded-Proto: https` |
