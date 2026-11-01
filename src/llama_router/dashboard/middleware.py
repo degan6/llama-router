@@ -17,7 +17,7 @@ from .auth_core import (
     AUTH_COOKIE,
     DashboardUser,
     non_admin_forbidden_get_path,
-    unsign_session,
+    session_claims,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,10 +151,25 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
 
         secret = await deps.get_dashboard_session_secret()
         raw = request.cookies.get(AUTH_COOKIE)
-        uid = unsign_session(raw, secret) if raw else None
+        claims = session_claims(raw, secret) if raw else None
+        uid = claims.user_id if claims else None
         user: DashboardUser | None = None
         if uid is not None:
             row = await db.get_dashboard_user_by_id(uid)
+            if row and row.get("auth_source", "local") == "local":
+                from .mfa_store import MfaStore
+
+                account = await MfaStore(db).account(uid)
+                if (
+                    account is None
+                    or claims is None
+                    or claims.mfa_version != account.version
+                    or (
+                        (account.enabled or settings.dashboard_require_second_factor)
+                        and not claims.mfa_verified
+                    )
+                ):
+                    row = None
             if row:
                 user = DashboardUser(
                     id=row["id"],
@@ -181,6 +196,9 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
         request.state.dashboard_user = user
 
         if user and request.method == "POST" and path == "/logout":
+            return await call_next(request)
+
+        if path == "/account/security" or path.startswith("/account/security/"):
             return await call_next(request)
 
         if not user.is_admin:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import time
 from dataclasses import dataclass
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -59,18 +60,37 @@ def verify_password(password: str, stored: str | None) -> bool:
     return secrets.compare_digest(dk, expected)
 
 
-def sign_session(user_id: int, secret: str) -> str:
+@dataclass(frozen=True)
+class SessionClaims:
+    user_id: int
+    mfa_version: int
+    mfa_verified: bool
+    authenticated_at: int
+
+
+def sign_session(
+    user_id: int, secret: str, *, mfa_version: int = 0, mfa_verified: bool = False
+) -> str:
     ser = URLSafeTimedSerializer(secret, salt="lr-dash-v1")
-    return ser.dumps({"u": user_id})
+    return ser.dumps(
+        {"u": user_id, "v": mfa_version, "mfa": mfa_verified, "at": int(time.time())}
+    )
 
 
-def unsign_session(token: str, secret: str) -> int | None:
+def session_claims(token: str, secret: str) -> SessionClaims | None:
     ser = URLSafeTimedSerializer(secret, salt="lr-dash-v1")
     try:
         d = ser.loads(token, max_age=SESSION_MAX_AGE)
-        return int(d["u"])
+        return SessionClaims(
+            int(d["u"]), int(d.get("v", 0)), d.get("mfa") is True, int(d.get("at", 0))
+        )
     except BadSignature, SignatureExpired, KeyError, TypeError, ValueError:
         return None
+
+
+def unsign_session(token: str, secret: str) -> int | None:
+    claims = session_claims(token, secret)
+    return claims.user_id if claims else None
 
 
 def normalize_username(username: str) -> str:

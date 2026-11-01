@@ -527,11 +527,9 @@ async def login_submit(
         or not verify_password(password, row["password_hash"])
     ):
         return RedirectResponse(url="/login?error=invalid", status_code=303)
-    await db.touch_dashboard_user_login(row["id"])
-    secret = await deps.get_dashboard_session_secret()
-    resp = RedirectResponse(url=_safe_next_url(next), status_code=303)
-    _set_session_cookie(resp, row["id"], secret)
-    return resp
+    from .mfa import password_login_response
+
+    return await password_login_response(request, row["id"], _safe_next_url(next))
 
 
 @router.get("/login/oidc")
@@ -608,6 +606,7 @@ async def logout_post(request: Request):
             logger.warning("OIDC logout at the provider skipped: %s", exc)
     resp = RedirectResponse(url=dest, status_code=303)
     resp.delete_cookie(AUTH_COOKIE)
+    resp.delete_cookie("lr_second_factor")
     return resp
 
 
@@ -635,6 +634,7 @@ async def users_page(request: Request):
             request,
             {
                 "dashboard_users": users,
+                "mfa_required": settings.dashboard_require_second_factor,
                 "users_exist": n > 0,
                 "management_keys": mgmt_keys,
                 "management_privileges": management_keys.PRIVILEGES,

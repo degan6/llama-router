@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Account security - llama-router{% endblock %}
+{% block nav_tabs %}{% endblock %}
+{% block content %}
+<div class="row justify-content-center"><div class="col-lg-8">
+    <h1 class="h3">Account security</h1>
+    <p>{% if mfa_required %}Second factor is required for all local accounts.{% else %}Add a second factor to protect your local account.{% endif %}</p>
+    <div id="security-error" class="alert alert-danger" role="alert" hidden></div>
+    {% if not webauthn_configured %}
+    <div class="alert alert-info">WebAuthn is not configured. Ask your administrator to set the dashboard's WebAuthn origin.</div>
+    {% else %}
+    <div id="security-actions">
+        <p class="small text-muted">Changes require a sign-in within the last five minutes. <a href="/login?next=/account/security">Sign in again</a> if needed.</p>
+        <h2 class="h5">Passkeys and security keys</h2>
+        <p>Use Touch ID, Windows Hello, your phone, or a security key that supports a PIN. Once enrolled, your password alone cannot sign you in.</p>
+        <ul class="list-group mb-3">
+        {% for credential in credentials %}
+            <li class="list-group-item d-flex justify-content-between align-items-center">{{ credential.name }}
+            {% if credentials | length > 1 %}<button class="btn btn-sm btn-outline-danger" data-remove-credential="{{ credential.id }}">Remove</button>{% endif %}</li>
+        {% else %}<li class="list-group-item text-muted">No authenticators registered.</li>{% endfor %}
+        </ul>
+        <label for="authenticator-name" class="form-label">New authenticator name</label>
+        <input id="authenticator-name" class="form-control mb-2" maxlength="100" value="My authenticator" autocomplete="off">
+        <button id="register-authenticator" data-prefix="/account/security/register" class="btn btn-primary">Register authenticator</button>
+        {% if credentials %}
+        <h2 class="h5 mt-4">Recovery codes</h2>
+        <p>Generating new codes immediately invalidates every unused old code. Keep at least one authenticator; register a replacement before removing your last device.</p>
+        <button id="regenerate-codes" class="btn btn-outline-secondary">Generate new recovery codes</button>
+        {% endif %}
+    </div>
+    {% include "recovery_codes.html" %}
+    {% endif %}
+</div></div>
+{% endblock %}
+{% block scripts %}{% include "webauthn_script.html" %}{% endblock %}

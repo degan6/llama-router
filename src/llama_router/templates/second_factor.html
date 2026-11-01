@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Second factor - llama-router{% endblock %}
+{% block nav_tabs %}{% endblock %}
+{% block content %}
+<div class="row justify-content-center"><div class="col-md-7 col-lg-6">
+    <div class="card shadow-sm"><div class="card-body p-4">
+        <h1 class="h4">{% if enrolling %}Set up your second factor{% else %}Verify your second factor{% endif %}</h1>
+        <div id="security-error" class="alert alert-danger" role="alert" hidden></div>
+        <div id="security-actions">
+        {% if enrolling %}
+            <p>This dashboard requires a second factor for local accounts. Register a passkey or security key to finish signing in.</p>
+            <p class="small text-muted">Use Touch ID, Windows Hello, your phone, or a security key that supports a PIN. Your device will ask you to verify.</p>
+            <label for="authenticator-name" class="form-label">Authenticator name</label>
+            <input id="authenticator-name" class="form-control mb-3" maxlength="100" value="My authenticator" autocomplete="off">
+            <button id="register-authenticator" data-prefix="/login/second-factor/register" class="btn btn-primary">Register authenticator</button>
+        {% else %}
+            <p>Approve the request using your registered passkey or security key.</p>
+            <button id="verify-authenticator" class="btn btn-primary">Use passkey or security key</button>
+            <details class="mt-4"><summary>Use a recovery code</summary>
+                <form id="recovery-form" class="mt-3">
+                    <label for="recovery-code" class="form-label">Single-use recovery code</label>
+                    <input id="recovery-code" class="form-control mb-2" autocomplete="off" required maxlength="100">
+                    <button class="btn btn-outline-secondary">Use recovery code</button>
+                </form>
+            </details>
+        {% endif %}
+        </div>
+        {% include "recovery_codes.html" %}
+        <a class="d-block mt-3" href="/login">Start sign-in again</a>
+    </div></div>
+</div></div>
+{% endblock %}
+{% block scripts %}{% include "webauthn_script.html" %}{% endblock %}

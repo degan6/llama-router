@@ -232,12 +232,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--reset-dashboard-second-factor",
+        metavar="USERNAME",
+        help="Remove a local user's second factor and revoke their sessions",
+    )
+    args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.reset_dashboard_second_factor:
+        from .dashboard.mfa_recovery import reset_second_factor
+
+        return asyncio.run(reset_second_factor(args.reset_dashboard_second_factor))
     asyncio.run(run())
     return 0
 

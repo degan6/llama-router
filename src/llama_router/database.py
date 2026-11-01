@@ -1829,7 +1829,8 @@ class Database:
         self, user_id: int, password_hash: str
     ) -> None:
         await self._execute(
-            "UPDATE dashboard_users SET password_hash = ? WHERE id = ?",
+            "UPDATE dashboard_users SET password_hash = ?, "
+            "mfa_version = mfa_version + 1 WHERE id = ?",
             (password_hash, user_id),
         )
 
@@ -1867,7 +1868,8 @@ def _row_to_management_key(row: Mapping[str, Any]) -> dict:
 
 _DASHBOARD_USER_COLUMNS = (
     "id, username, password_hash, is_admin, created_at, auth_source, "
-    "oidc_issuer, oidc_subject, email, display_name, last_login_at"
+    "oidc_issuer, oidc_subject, email, display_name, last_login_at, "
+    "mfa_enabled, mfa_version"
 )
 
 
@@ -1884,6 +1886,8 @@ def _row_to_dashboard_user(row: Mapping[str, Any]) -> dict:
         "email": row["email"],
         "display_name": row["display_name"],
         "last_login_at": row["last_login_at"],
+        "mfa_enabled": bool(row["mfa_enabled"]),
+        "mfa_version": int(row["mfa_version"]),
     }
 
 

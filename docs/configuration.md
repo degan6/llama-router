@@ -39,7 +39,9 @@ SQLite is the default and fits a single router. To move to PostgreSQL, see
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `SESSION_SECRET` | *(empty)* | Secret for signing session cookies. Empty: a random one is generated and kept in the database |
-| `DASHBOARD_COOKIE_SECURE` | `false` | Send session cookies over HTTPS only. Set `true` behind TLS |
+| `DASHBOARD_COOKIE_SECURE` | `false` | Send session cookies over HTTPS only. Set `true` behind TLS. Local login also uses secure cookies automatically when the WebAuthn origin is HTTPS |
+| `DASHBOARD_WEBAUTHN_ORIGIN` | *(empty)* | Fixed external origin, e.g. `https://llm.example.org`, without a path or trailing slash. Enables WebAuthn enrollment. Must use a hostname and HTTPS; `http://localhost:PORT` is allowed for development. The hostname becomes the relying party ID; changing it requires re-enrollment |
+| `DASHBOARD_REQUIRE_SECOND_FACTOR` | `false` | Require a second factor for every local dashboard user, including admins. Requires `DASHBOARD_WEBAUTHN_ORIGIN`. Users without an authenticator must enroll after entering their password, before dashboard access. Existing password-only sessions must sign in again. SSO accounts are exempt |
 | `OIDC_ISSUER` | *(empty)* | OpenID Connect issuer URL. Empty turns single sign-on off |
 | `OIDC_CLIENT_ID` | *(empty)* | Client ID |
 | `OIDC_CLIENT_SECRET` | *(empty)* | Client secret |

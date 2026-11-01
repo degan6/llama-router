@@ -7,6 +7,16 @@ described in their git tags and GitHub Releases.
 
 ## [Unreleased]
 
+### Added
+
+- Password + WebAuthn second factor for local dashboard accounts, with multiple
+  named authenticators, single-use recovery codes and an operator recovery
+  command. `LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR` enforces enrollment
+  and second-factor login for all local users, including admins, and rejects
+  existing password-only sessions. Configure a stable HTTPS origin with
+  `LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN`; SSO and API-key authentication stay
+  unchanged. Rate limiting is scoped separately.
+
 ## [0.26.1] - 2026-10-31
 
 ### Fixed
