@@ -7,6 +7,13 @@ described in their git tags and GitHub Releases.
 
 ## [Unreleased]
 
+### Added
+
+- Regression coverage for deleting regular and admin users: their personal API
+  keys are removed and refused immediately, including cached keys, with both
+  API-KEY and Bearer authentication. Shared admin-issued keys remain unowned
+  and survive account deletion.
+
 ## [0.26.1] - 2026-10-31
 
 ### Fixed
