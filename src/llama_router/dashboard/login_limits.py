@@ -26,8 +26,8 @@ class LoginAttemptLimiter:
     def __init__(
         self,
         *,
-        account_attempts: int = 5,
-        ip_attempts: int = 20,
+        account_attempts: int = 30,
+        ip_attempts: int = 120,
         window_seconds: int = 300,
         max_entries: int = 10_000,
         clock: Callable[[], float] = time.monotonic,

@@ -510,8 +510,8 @@ Each provider can also carry extra headers (one `Name: value` per line) and mode
 ## Single sign-on (OpenID Connect)
 
 Local password sign-in limits attempts per account and client address, returning
-HTTP 429 with a retry delay when exhausted. Defaults are five attempts per
-account and twenty per address within five minutes, including successful
+HTTP 429 with a retry delay when exhausted. Defaults are 30 attempts per
+account and 120 per address within five minutes, including successful
 sign-ins. See [dashboard sign-in configuration](docs/configuration.md#dashboard-sign-in)
 for settings and proxy/multiple-process deployment details.
 

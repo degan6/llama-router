@@ -11,6 +11,7 @@ described in their git tags and GitHub Releases.
 
 - Dashboard password sign-in now limits attempts by account and client address,
   returning HTTP 429 with `Retry-After` during the configurable cooldown.
+  Defaults allow 30 attempts per account and 120 per address in five minutes.
 
 ## [0.26.1] - 2026-10-31
 

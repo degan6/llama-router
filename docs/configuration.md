@@ -54,8 +54,8 @@ processes need a shared limit at the reverse proxy for a deployment-wide bound.
 |----------|---------|---------|
 | `SESSION_SECRET` | *(empty)* | Secret for signing session cookies. Empty: a random one is generated and kept in the database |
 | `DASHBOARD_COOKIE_SECURE` | `false` | Send session cookies over HTTPS only. Set `true` behind TLS |
-| `DASHBOARD_LOGIN_ACCOUNT_ATTEMPTS` | `5` | Password attempts per normalized account per window; integer >= 1 |
-| `DASHBOARD_LOGIN_IP_ATTEMPTS` | `20` | Password attempts per client address per window; integer >= 1 |
+| `DASHBOARD_LOGIN_ACCOUNT_ATTEMPTS` | `30` | Password attempts per normalized account per window; integer >= 1 |
+| `DASHBOARD_LOGIN_IP_ATTEMPTS` | `120` | Password attempts per client address per window; integer >= 1 |
 | `DASHBOARD_LOGIN_WINDOW_SECONDS` | `300` | Fixed password-attempt window in seconds; integer >= 1 |
 | `OIDC_ISSUER` | *(empty)* | OpenID Connect issuer URL. Empty turns single sign-on off |
 | `OIDC_CLIENT_ID` | *(empty)* | Client ID |

@@ -22,7 +22,7 @@ def test_too_small_store_is_rejected() -> None:
 
 def test_account_limit_spans_client_addresses_and_expires() -> None:
     now = [100.0]
-    limiter = LoginAttemptLimiter(clock=lambda: now[0])
+    limiter = LoginAttemptLimiter(account_attempts=5, clock=lambda: now[0])
     for i in range(5):
         assert limiter.reserve(f"client-{i}", "alice") == 0
     assert limiter.reserve("another-client", "alice") == 300
@@ -43,7 +43,9 @@ def test_address_limit_spans_accounts_and_invalid_usernames() -> None:
 
 def test_capacity_does_not_evict_active_limits_and_recovers() -> None:
     now = [0.0]
-    limiter = LoginAttemptLimiter(max_entries=2, clock=lambda: now[0])
+    limiter = LoginAttemptLimiter(
+        account_attempts=5, max_entries=2, clock=lambda: now[0]
+    )
     assert limiter.reserve("one", "alice") == 0
     assert limiter.reserve("two", "bob") == 300
     # Existing keys still have their original budget.
@@ -87,12 +89,12 @@ async def test_concurrent_attempts_reserve_before_credential_lookup(
     responses = await asyncio.gather(
         *(
             client.post("/login", data={"username": "alice", "password": "bad"})
-            for _ in range(10)
+            for _ in range(35)
         )
     )
-    assert sum(r.status_code == 303 for r in responses) == 5
+    assert sum(r.status_code == 303 for r in responses) == 30
     assert sum(r.status_code == 429 for r in responses) == 5
-    assert calls == 5
+    assert calls == 30
     for response in responses:
         if response.status_code == 429:
             assert 1 <= int(response.headers["Retry-After"]) <= 300
