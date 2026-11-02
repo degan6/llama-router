@@ -60,6 +60,8 @@ async def test_navigation_stays_consistent_across_pages(
         expected.extend(["/users", "/#keys-pane", "/#workers-pane", "/#log-pane"])
         if cache is not None:
             expected.append("/#cache-pane")
+    else:
+        expected.append("/#log-pane")
 
     for path in pages:
         response = await client.get(path)
