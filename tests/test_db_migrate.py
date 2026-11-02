@@ -581,7 +581,7 @@ def test_webauthn_upgrade_preserves_existing_account_security(tmp_path: Path) ->
     dbfile = tmp_path / "before_webauthn.db"
     sync_url = f"sqlite:///{dbfile}"
     cfg = _alembic_cfg(sync_url)
-    command.upgrade(cfg, "026_session_version")
+    command.upgrade(cfg, "027_api_key_autoincrement")
     con = sqlite3.connect(dbfile)
     try:
         con.execute(

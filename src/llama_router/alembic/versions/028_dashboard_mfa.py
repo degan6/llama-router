@@ -3,8 +3,8 @@
 import sqlalchemy as sa
 from alembic import op
 
-revision = "027_dashboard_mfa"
-down_revision = "026_session_version"
+revision = "028_dashboard_mfa"
+down_revision = "027_api_key_autoincrement"
 branch_labels = None
 depends_on = None
 
