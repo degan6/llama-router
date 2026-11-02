@@ -1,5 +1,9 @@
+import ipaddress
+import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from sqlalchemy.engine import make_url
 from sqlalchemy.engine.url import URL
@@ -178,6 +182,9 @@ class Settings(BaseSettings):
     # are Secure whenever the request came over HTTPS, directly or through a
     # proxy that sets X-Forwarded-Proto: https.
     dashboard_cookie_secure: bool = False
+    # Fixed external origin for WebAuthn; never derive it from proxy headers.
+    dashboard_webauthn_origin: str = ""
+    dashboard_require_second_factor: bool = False
     # Comma-separated extra origins (https://llm.example.org) allowed to send
     # state-changing requests to the dashboard. Needed only behind a plain
     # HTTP proxy that rewrites Host without setting X-Forwarded-Host; the
@@ -221,6 +228,65 @@ class Settings(BaseSettings):
     oidc_allow_insecure: bool = False
 
     model_config = {"env_prefix": "LLAMA_ROUTER_"}
+
+    @model_validator(mode="after")
+    def validate_webauthn(self) -> Settings:
+        origin = self.dashboard_webauthn_origin
+        if self.dashboard_require_second_factor and not origin:
+            raise ValueError(
+                "LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR requires "
+                "LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN"
+            )
+        if origin:
+            try:
+                parsed = urlsplit(origin)
+            except ValueError as exc:
+                raise ValueError(
+                    "LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN is invalid"
+                ) from exc
+            valid = parsed.scheme == "https" or (
+                parsed.scheme == "http" and parsed.hostname == "localhost"
+            )
+            if (
+                not valid
+                or not parsed.hostname
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or parsed.username
+                or parsed.password
+            ):
+                raise ValueError(
+                    "LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN must be an HTTPS "
+                    "origin without a path (http://localhost allowed for development)"
+                )
+            try:
+                ipaddress.ip_address(parsed.hostname)
+            except ValueError:
+                pass
+            else:
+                raise ValueError(
+                    "LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN requires a hostname, "
+                    "not an IP address"
+                )
+            try:
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(
+                    "LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN has an invalid port"
+                ) from exc
+            hostname = parsed.hostname.encode("idna").decode("ascii")
+            if not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in hostname.split(".")
+            ):
+                raise ValueError(
+                    "LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN has an invalid hostname"
+                )
+            default_port = 443 if parsed.scheme == "https" else 80
+            suffix = f":{port}" if port is not None and port != default_port else ""
+            self.dashboard_webauthn_origin = f"{parsed.scheme}://{hostname}{suffix}"
+        return self
 
     def effective_database_url(self) -> str:
         """URL used by the app's async SQLAlchemy engine."""

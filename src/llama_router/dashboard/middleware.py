@@ -269,14 +269,17 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
         user: DashboardUser | None = None
         if session is not None:
             row = await db.get_dashboard_user_by_id(session.user_id)
-            # Revoked (session_version bumped), expired, or awaiting approval.
             if row and session.valid_for(row):
-                user = DashboardUser(
-                    id=row["id"],
-                    username=row["username"],
-                    is_admin=row["is_admin"],
-                    auth_source=row.get("auth_source") or "local",
+                requires_mfa = row.get("auth_source", "local") == "local" and (
+                    row["mfa_enabled"] or settings.dashboard_require_second_factor
                 )
+                if not requires_mfa or session.mfa_verified:
+                    user = DashboardUser(
+                        id=row["id"],
+                        username=row["username"],
+                        is_admin=row["is_admin"],
+                        auth_source=row.get("auth_source") or "local",
+                    )
 
         if user is None:
             if path.startswith("/api/"):
@@ -296,6 +299,11 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
         request.state.dashboard_user = user
 
         if user and request.method == "POST" and path in _LOGOUT_PATHS:
+            return await call_next(request)
+
+        if path in ("/profile", "/account/security") or path.startswith(
+            "/account/security/"
+        ):
             return await call_next(request)
 
         if not user.is_admin:

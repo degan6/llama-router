@@ -46,6 +46,8 @@ SQLite is the default and fits a single router. To move to PostgreSQL, see
 | `ADMIN_PASSWORD` | *(empty)* | That administrator's password, at least 8 characters |
 | `MAX_API_KEYS_PER_USER` | `20` | Most API keys one user may issue themselves on My API keys (0: no limit). Keys an admin issues don't count |
 | `MAX_CHAT_CONVERSATIONS_PER_USER` | `500` | Most chat conversations one user may keep; past it they must delete one to start another (0: no limit) |
+| `DASHBOARD_WEBAUTHN_ORIGIN` | *(empty)* | Fixed external origin, e.g. `https://llm.example.org`, without a path or trailing slash. Enables WebAuthn enrollment. Must use a hostname and HTTPS; `http://localhost:PORT` is allowed for development. The hostname becomes the relying party ID; changing it requires re-enrollment |
+| `DASHBOARD_REQUIRE_SECOND_FACTOR` | `false` | Require a second factor for every local dashboard user, including admins. Requires `DASHBOARD_WEBAUTHN_ORIGIN`. Users without an authenticator must enroll after entering their password, before dashboard access. Existing password-only sessions must sign in again. SSO accounts are exempt |
 | `OIDC_ISSUER` | *(empty)* | OpenID Connect issuer URL. Empty turns single sign-on off |
 | `OIDC_CLIENT_ID` | *(empty)* | Client ID |
 | `OIDC_CLIENT_SECRET` | *(empty)* | Client secret |

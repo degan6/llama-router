@@ -20,6 +20,7 @@ from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
+    Response,
 )
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -459,13 +460,21 @@ def _cookie_secure(request: Request) -> bool:
     A client that fakes the header over plain HTTP only gets a cookie its
     own browser will not send back.
     """
-    if settings.dashboard_cookie_secure:
+    if (
+        settings.dashboard_cookie_secure
+        or settings.dashboard_webauthn_origin.startswith("https://")
+    ):
         return True
     return _external_origin(request)[0] == "https"
 
 
 def _set_session_cookie(
-    request: Request, resp: RedirectResponse, user: dict[str, Any], secret: str
+    request: Request,
+    resp: Response,
+    user: dict[str, Any],
+    secret: str,
+    *,
+    mfa_verified: bool = False,
 ) -> None:
     resp.set_cookie(
         AUTH_COOKIE,
@@ -474,6 +483,7 @@ def _set_session_cookie(
             secret,
             version=user.get("session_version") or 0,
             username=user["username"],
+            mfa_verified=mfa_verified,
         ),
         httponly=True,
         samesite="lax",
@@ -555,11 +565,14 @@ async def login_submit(
     if not ok or row is None:
         return RedirectResponse(url="/login?error=invalid", status_code=303)
     login_throttle.throttle.success(keys)
-    await db.touch_dashboard_user_login(row["id"])
-    secret = await deps.get_dashboard_session_secret()
-    resp = RedirectResponse(url=_safe_next_url(next), status_code=303)
-    _set_session_cookie(request, resp, row, secret)
-    return resp
+    from .mfa import password_login_response
+
+    return await password_login_response(
+        request,
+        row["id"],
+        _safe_next_url(next),
+        session_version=row["session_version"],
+    )
 
 
 def _login_throttled(request: Request, next_url: str, wait: float) -> HTMLResponse:
@@ -669,6 +682,7 @@ async def logout_post(request: Request):
             logger.warning("OIDC logout at the provider skipped: %s", exc)
     resp = RedirectResponse(url=dest, status_code=303)
     _clear_cookie(request, resp, AUTH_COOKIE)
+    _clear_cookie(request, resp, "lr_second_factor")
     return resp
 
 
@@ -704,6 +718,7 @@ async def users_page(request: Request):
             request,
             {
                 "dashboard_users": users,
+                "mfa_required": settings.dashboard_require_second_factor,
                 "users_exist": bool(users),
                 "management_keys": mgmt_keys,
                 "management_privileges": management_keys.PRIVILEGES,
@@ -790,7 +805,16 @@ async def users_set_password(
         row = await db.get_dashboard_user_by_id(user_id)
         if row is not None:
             secret = await deps.get_dashboard_session_secret()
-            _set_session_cookie(request, resp, row, secret)
+            from .auth_core import unsign_session
+
+            claims = unsign_session(request.cookies.get(AUTH_COOKIE, ""), secret)
+            _set_session_cookie(
+                request,
+                resp,
+                row,
+                secret,
+                mfa_verified=bool(claims and claims.mfa_verified),
+            )
     return resp
 
 
