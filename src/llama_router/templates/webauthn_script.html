@@ -1,0 +1,79 @@
+<script>
+function fromBase64(value) {
+    const data = atob(value.replace(/-/g, '+').replace(/_/g, '/'));
+    return Uint8Array.from(data, c => c.charCodeAt(0));
+}
+function toBase64(buffer) {
+    return btoa(String.fromCharCode(...new Uint8Array(buffer))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function securityRequest(path, body = {}, method = 'POST') {
+    const response = await fetch(path, {
+        method, credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-Llama-Router-Security': '1'},
+        body: JSON.stringify(body),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'The request could not be completed.');
+    return result;
+}
+function showSecurityError(error) {
+    const element = document.getElementById('security-error');
+    element.textContent = error.name === 'NotAllowedError' ? 'The authenticator request was cancelled or timed out. Try again.' : error.message;
+    element.hidden = false;
+}
+function showRecoveryCodes(codes, next) {
+    document.getElementById('recovery-codes').textContent = codes.join('\n');
+    document.getElementById('recovery-panel').hidden = false;
+    document.getElementById('security-actions').hidden = true;
+    document.getElementById('security-continue').href = next;
+}
+async function runCeremony(prefix, register) {
+    const button = document.getElementById(register ? 'register-authenticator' : 'verify-authenticator');
+    button.disabled = true;
+    document.getElementById('security-error').hidden = true;
+    try {
+        if (!window.isSecureContext || !window.PublicKeyCredential) throw new Error('WebAuthn requires a supported browser and HTTPS at the configured dashboard hostname.');
+        const name = document.getElementById('authenticator-name')?.value || 'YubiKey';
+        const start = await securityRequest(prefix + '/options', {name});
+        const options = start.options;
+        options.challenge = fromBase64(options.challenge);
+        if (register) options.user.id = fromBase64(options.user.id);
+        for (const descriptor of (register ? options.excludeCredentials : options.allowCredentials) || []) descriptor.id = fromBase64(descriptor.id);
+        const credential = register ? await navigator.credentials.create({publicKey: options}) : await navigator.credentials.get({publicKey: options});
+        const serialized = {id: credential.id, rawId: toBase64(credential.rawId), type: credential.type, response: {clientDataJSON: toBase64(credential.response.clientDataJSON)}};
+        if (register) {
+            serialized.response.attestationObject = toBase64(credential.response.attestationObject);
+            serialized.response.transports = credential.response.getTransports?.() || [];
+        } else {
+            serialized.response.authenticatorData = toBase64(credential.response.authenticatorData);
+            serialized.response.signature = toBase64(credential.response.signature);
+            if (credential.response.userHandle) serialized.response.userHandle = toBase64(credential.response.userHandle);
+        }
+        const result = await securityRequest(prefix + '/verify', {token: start.token, credential: JSON.stringify(serialized)});
+        if (result.recovery_codes?.length) showRecoveryCodes(result.recovery_codes, result.next);
+        else window.location.assign(result.next);
+    } catch (error) { showSecurityError(error); }
+    finally { button.disabled = false; }
+}
+document.getElementById('register-authenticator')?.addEventListener('click', () => runCeremony(document.getElementById('register-authenticator').dataset.prefix, true));
+document.getElementById('verify-authenticator')?.addEventListener('click', () => runCeremony('/login/second-factor/authenticate', false));
+document.getElementById('recovery-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+        const result = await securityRequest('/login/second-factor/recovery', {code: document.getElementById('recovery-code').value});
+        window.location.assign(result.next);
+    } catch (error) { showSecurityError(error); }
+});
+document.getElementById('regenerate-codes')?.addEventListener('click', async () => {
+    try {
+        const result = await securityRequest('/account/security/recovery-codes');
+        showRecoveryCodes(result.recovery_codes, '/profile');
+    } catch (error) { showSecurityError(error); }
+});
+document.querySelectorAll('[data-remove-credential]').forEach(button => button.addEventListener('click', async () => {
+    try {
+        await securityRequest('/account/security/credentials/' + encodeURIComponent(button.dataset.removeCredential), {}, 'DELETE');
+        window.location.reload();
+    } catch (error) { showSecurityError(error); }
+}));
+</script>

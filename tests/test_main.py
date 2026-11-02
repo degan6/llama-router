@@ -54,3 +54,19 @@ def test_quiet_health_checks_keeps_records_of_another_shape() -> None:
         "uvicorn.access", logging.INFO, __file__, 0, "started", None, None
     )
     assert QuietHealthChecks().filter(record) is True
+
+
+def test_second_factor_reset_command_does_not_start_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from llama_router.dashboard import mfa_recovery
+
+    usernames: list[str] = []
+
+    async def reset(username: str) -> int:
+        usernames.append(username)
+        return 0
+
+    monkeypatch.setattr(mfa_recovery, "reset_second_factor", reset)
+    assert main(["--reset-dashboard-second-factor", "alice"]) == 0
+    assert usernames == ["alice"]

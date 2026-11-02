@@ -28,6 +28,7 @@ dependencies = [
   "sentry-sdk[fastapi]>=2.20",
   "sqlalchemy[asyncio]>=2.0",
   "uvicorn[standard]>=0.34",
+  "webauthn>=3.0.1",
   "websockets>=13",
 ]
 
