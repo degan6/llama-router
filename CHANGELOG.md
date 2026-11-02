@@ -16,6 +16,9 @@ described in their git tags and GitHub Releases.
 
 - SQLite no longer reuses deleted API-key IDs, preventing new keys from
   inheriting access to retained request logs for deleted keys.
+### Changed
+
+- Move Decisions from the top banner to the shared dashboard navigation, immediately after Models.
 
 ## [0.27.0] - 2026-11-01
 

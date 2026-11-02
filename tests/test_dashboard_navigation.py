@@ -54,7 +54,13 @@ async def test_navigation_stays_consistent_across_pages(
     client.cookies.set(AUTH_COOKIE, sign_session(user_id, settings.session_secret))
     provider = await db.add_provider("test-provider", ProviderProtocol.OLLAMA)
     pages = ["/", "/chat", "/my-keys", "/decisions", f"/providers/{provider.id}"]
-    expected = ["/#providers-pane", "/#benchmarks-pane", "/#models-pane", "/chat"]
+    expected = [
+        "/#providers-pane",
+        "/#benchmarks-pane",
+        "/#models-pane",
+        "/decisions",
+        "/chat",
+    ]
     if role != "viewer":
         pages.append("/users")
         expected.extend(["/users", "/#keys-pane", "/#workers-pane", "/#log-pane"])
@@ -67,7 +73,7 @@ async def test_navigation_stays_consistent_across_pages(
         response = await client.get(path)
         assert response.status_code == 200, path
         items = _Navigation(response.text).items
-        # Provider details and Decisions append their page-specific marker.
+        # Provider details append their page-specific marker.
         shared = [
             item for item in items if item.get("href") or item.get("data-bs-target")
         ]
@@ -78,7 +84,8 @@ async def test_navigation_stays_consistent_across_pages(
         active = [
             item for item in items if "active" in (item.get("class") or "").split()
         ]
-        if path in ("/", "/chat", "/users"):
+        assert response.text.count('href="/decisions"') == 1, path
+        if path in ("/", "/chat", "/users", "/decisions"):
             assert len(active) == 1, path
             assert active[0].get("href") == path or (
                 path == "/" and active[0].get("data-bs-target") == "#providers-pane"
