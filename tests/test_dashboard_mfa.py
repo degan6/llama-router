@@ -303,7 +303,8 @@ async def test_enforcement_rejects_old_password_sessions_but_exempts_sso(
     client.cookies.clear()
     client.cookies.set(AUTH_COOKIE, sign_session(oidc_uid, settings.session_secret))
     assert (await client.get("/api/status")).status_code == 200
-    assert (await client.get("/account/security")).status_code == 403
+    assert (await client.get("/profile")).status_code == 200
+    assert "single sign-on provider" in (await client.get("/profile")).text
 
 
 async def test_challenges_are_bound_to_pending_login_and_consumed(
@@ -368,7 +369,7 @@ async def test_csrf_and_management_keys_cannot_enroll(
     assert response.status_code == 401
 
 
-async def test_old_sessions_and_password_changes_cannot_manage_factors(
+async def test_older_session_can_manage_factors_until_password_changes(
     mfa_client: tuple[httpx.AsyncClient, Database], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client, db = mfa_client
@@ -380,7 +381,7 @@ async def test_old_sessions_and_password_changes_cannot_manage_factors(
         response = await client.post(
             "/account/security/register/options", json={}, headers=HEADERS
         )
-        assert response.status_code == 403
+        assert response.status_code == 200
     await db.update_dashboard_user_password(uid, hash_password("new-password"))
     assert (await client.get("/api/status")).status_code == 401
 
@@ -653,3 +654,16 @@ async def test_password_change_during_login_invalidates_password_proof(
     assert (await login(client)).status_code == 401
     assert AUTH_COOKIE not in client.cookies
     assert PENDING_COOKIE not in client.cookies
+
+
+@pytest.mark.parametrize("admin", [True, False])
+async def test_profile_is_available_to_local_admins_and_viewers(
+    mfa_client: tuple[httpx.AsyncClient, Database], admin: bool
+) -> None:
+    client, db = mfa_client
+    await create_user(db, admin=admin)
+    await login(client)
+    response = await client.get("/profile")
+    assert response.status_code == 200
+    assert 'href="/profile" aria-label="Profile for alice"' in response.text
+    assert 'href="/account/security"' not in response.text

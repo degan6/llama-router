@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import secrets
-import time
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
@@ -47,11 +46,10 @@ from .routes import (
 
 router = APIRouter()
 PENDING_COOKIE = "lr_second_factor"
-RECENT_AUTH_SECONDS = 300
 
 
 class CeremonyStart(BaseModel):
-    name: str = Field(default="My authenticator", min_length=1, max_length=100)
+    name: str = Field(default="YubiKey", min_length=1, max_length=100)
 
 
 class CeremonyFinish(BaseModel):
@@ -106,7 +104,7 @@ async def _pending(request: Request) -> tuple[Flow, LocalAccount]:
     return await _valid_flow(request.cookies.get(PENDING_COOKIE, ""), "pending")
 
 
-async def _session_account(request: Request, *, recent: bool = False) -> LocalAccount:
+async def _session_account(request: Request) -> LocalAccount:
     secret = await deps.get_dashboard_session_secret()
     claims = unsign_session(request.cookies.get(AUTH_COOKIE, ""), secret)
     account = await MfaStore(deps.get_db()).account(claims.user_id) if claims else None
@@ -118,10 +116,6 @@ async def _session_account(request: Request, *, recent: bool = False) -> LocalAc
         or (account.enabled and not claims.mfa_verified)
     ):
         raise HTTPException(status_code=403, detail="Sign in with a local account")
-    if recent and (time.time() - claims.issued_at > RECENT_AUTH_SECONDS):
-        raise HTTPException(
-            status_code=403, detail="Sign in again before changing security settings"
-        )
     return account
 
 
@@ -199,10 +193,16 @@ async def second_factor_page(request: Request) -> Response:
     )
 
 
+@router.get("/profile")
 @router.get("/account/security")
 async def security_page(request: Request) -> Response:
-    account = await _session_account(request)
-    credentials = await MfaStore(deps.get_db()).credentials(account.id)
+    user = getattr(request.state, "dashboard_user", None)
+    if user is None:
+        raise HTTPException(status_code=403, detail="Sign in to view your profile")
+    credentials = []
+    if not user.is_sso:
+        account = await _session_account(request)
+        credentials = await MfaStore(deps.get_db()).credentials(account.id)
     return _private(
         templates.TemplateResponse(
             request,
@@ -228,7 +228,7 @@ async def _registration_account(request: Request) -> tuple[LocalAccount, str]:
                 detail="Complete second factor before adding an authenticator",
             )
         return account, flow.token
-    return await _session_account(request, recent=True), ""
+    return await _session_account(request), ""
 
 
 @router.post("/account/security/register/options")
@@ -258,7 +258,7 @@ async def registration_options(request: Request, body: CeremonyStart) -> Respons
         challenge=bytes_to_base64url(options.challenge),
         origin=origin,
         rp_id=rp_id,
-        name=body.name.strip() or "My authenticator",
+        name=body.name.strip() or "YubiKey",
         pending=digest(pending) if pending else "",
     )
     return _private(
@@ -317,9 +317,7 @@ async def registration_verify(request: Request, body: CeremonyFinish) -> Respons
     updated = await store.account(account.id)
     if updated is None:
         raise HTTPException(status_code=401, detail="Sign in again")
-    response = JSONResponse(
-        {"ok": True, "recovery_codes": codes, "next": "/account/security"}
-    )
+    response = JSONResponse({"ok": True, "recovery_codes": codes, "next": "/profile"})
     await _set_session(request, response, updated, verified=True)
     return response
 
@@ -407,7 +405,7 @@ async def recovery_login(request: Request, body: RecoveryAttempt) -> Response:
         raise HTTPException(
             status_code=401, detail="Invalid recovery code. Sign in again."
         )
-    response = JSONResponse({"ok": True, "next": "/account/security"})
+    response = JSONResponse({"ok": True, "next": "/profile"})
     await _set_session(request, response, account, verified=True)
     return response
 
@@ -415,7 +413,7 @@ async def recovery_login(request: Request, body: RecoveryAttempt) -> Response:
 @router.post("/account/security/recovery-codes")
 async def regenerate_codes(request: Request) -> Response:
     _csrf(request)
-    account = await _session_account(request, recent=True)
+    account = await _session_account(request)
     if not account.enabled:
         raise HTTPException(status_code=400, detail="Register an authenticator first")
     codes = _codes()
@@ -427,7 +425,7 @@ async def regenerate_codes(request: Request) -> Response:
 @router.delete("/account/security/credentials/{credential_id}")
 async def remove_credential(request: Request, credential_id: str) -> Response:
     _csrf(request)
-    account = await _session_account(request, recent=True)
+    account = await _session_account(request)
     if not await MfaStore(deps.get_db()).delete_credential(account, credential_id):
         raise HTTPException(
             status_code=400,

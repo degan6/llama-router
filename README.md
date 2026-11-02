@@ -538,19 +538,19 @@ SSO accounts continue to follow the identity provider's authentication policy.
 API keys and management keys keep their existing authentication.
 
 Set `LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR=false` to make enrollment
-optional. Users can enroll under **Account security**. Once enrolled, that
-account always requires its second factor even when the global policy is
-optional. Turning the policy off does not remove anyone's authenticators.
+optional. Users can enroll on their **Profile**, opened by clicking their
+username. Once enrolled, that account always requires its second factor even
+when the global policy is optional. Turning the policy off does not remove anyone's authenticators.
 
-Account security lets users register several named authenticators, remove a
-replaced device and generate recovery codes. Changes require signing in within
-the last five minutes. Register a replacement before removing the last
-authenticator. Enrollment and device removal revoke older sessions.
+The profile page lets users register several named authenticators, remove a
+replaced device and generate recovery codes. Register a replacement before
+removing the last authenticator. Enrollment and device removal revoke older
+sessions.
 
 Save the ten recovery codes displayed after first enrollment. Each is a
 single-use alternative to WebAuthn **after entering the password**. Only hashes
 are stored; generating new codes invalidates the previous set. A recovery login
-opens Account security so you can add a replacement device.
+opens the profile page so you can add a replacement device.
 
 If all devices and recovery codes are lost, an operator with access to the
 server can reset a local user's second factor:

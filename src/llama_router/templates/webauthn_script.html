@@ -33,7 +33,7 @@ async function runCeremony(prefix, register) {
     document.getElementById('security-error').hidden = true;
     try {
         if (!window.isSecureContext || !window.PublicKeyCredential) throw new Error('WebAuthn requires a supported browser and HTTPS at the configured dashboard hostname.');
-        const name = document.getElementById('authenticator-name')?.value || 'My authenticator';
+        const name = document.getElementById('authenticator-name')?.value || 'YubiKey';
         const start = await securityRequest(prefix + '/options', {name});
         const options = start.options;
         options.challenge = fromBase64(options.challenge);
@@ -67,7 +67,7 @@ document.getElementById('recovery-form')?.addEventListener('submit', async event
 document.getElementById('regenerate-codes')?.addEventListener('click', async () => {
     try {
         const result = await securityRequest('/account/security/recovery-codes');
-        showRecoveryCodes(result.recovery_codes, '/account/security');
+        showRecoveryCodes(result.recovery_codes, '/profile');
     } catch (error) { showSecurityError(error); }
 });
 document.querySelectorAll('[data-remove-credential]').forEach(button => button.addEventListener('click', async () => {

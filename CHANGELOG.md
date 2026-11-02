@@ -7,6 +7,11 @@ described in their git tags and GitHub Releases.
 
 ## [Unreleased]
 
+### Changed
+
+- Open the profile page from the dashboard username. Authenticator management,
+  registration and recovery codes use separate cards.
+
 ### Added
 
 - Password + WebAuthn second factor for local dashboard accounts, with multiple

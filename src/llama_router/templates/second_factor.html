@@ -11,7 +11,7 @@
             <p>This dashboard requires a second factor for local accounts. Register a passkey or security key to finish signing in.</p>
             <p class="small text-muted">Use Touch ID, Windows Hello, your phone, or a security key that supports a PIN. Your device will ask you to verify.</p>
             <label for="authenticator-name" class="form-label">Authenticator name</label>
-            <input id="authenticator-name" class="form-control mb-3" maxlength="100" value="My authenticator" autocomplete="off">
+            <input id="authenticator-name" class="form-control mb-3" maxlength="100" value="YubiKey" autocomplete="off">
             <button id="register-authenticator" data-prefix="/login/second-factor/register" class="btn btn-primary">Register authenticator</button>
         {% else %}
             <p>Approve the request using your registered passkey or security key.</p>
