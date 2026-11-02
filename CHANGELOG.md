@@ -12,6 +12,11 @@ described in their git tags and GitHub Releases.
 - Non-admin dashboard users can view request logs and counts for their own
   current API keys. Backend error details remain admin-only.
 
+### Fixed
+
+- SQLite no longer reuses deleted API-key IDs, preventing new keys from
+  inheriting access to retained request logs for deleted keys.
+
 ## [0.27.0] - 2026-11-01
 
 ### Security

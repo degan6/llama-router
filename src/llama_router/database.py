@@ -895,13 +895,20 @@ class Database:
         self, limit: int = 200, offset: int = 0, *, owner_user_id: int | None = None
     ) -> list[RequestLog]:
         """Return all logs, or only requests made with this user's existing keys."""
-        where, params = self._request_log_owner(owner_user_id)
-        rows = await self._select_all(
-            # id breaks ties: MySQL TIMESTAMP has whole-second precision.
-            f"SELECT * FROM request_log {where}"  # noqa: S608 - fixed ownership clause; values are bound
-            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (*params, limit, offset),
-        )
+        # id breaks ties: MySQL TIMESTAMP has whole-second precision.
+        if owner_user_id is None:
+            rows = await self._select_all(
+                "SELECT * FROM request_log ORDER BY created_at DESC, id DESC "
+                "LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        else:
+            rows = await self._select_all(
+                "SELECT * FROM request_log WHERE api_key_id IN "
+                "(SELECT id FROM api_keys WHERE owner_user_id = ?) "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (owner_user_id, limit, offset),
+            )
         return [_row_to_request_log(r) for r in rows]
 
     async def get_model_request_counts(self) -> dict[str, int]:
@@ -911,22 +918,16 @@ class Database:
         )
         return {r["model"]: r["cnt"] for r in rows}
 
-    @staticmethod
-    def _request_log_owner(owner_user_id: int | None) -> tuple[str, tuple[int, ...]]:
-        if owner_user_id is None:
-            return "", ()
-        return (
-            "WHERE api_key_id IN (SELECT id FROM api_keys WHERE owner_user_id = ?) ",
-            (owner_user_id,),
-        )
-
     async def count_request_logs(self, *, owner_user_id: int | None = None) -> int:
         """Count the same user-scoped rows as get_request_logs."""
-        where, params = self._request_log_owner(owner_user_id)
-        row = await self._select_one(
-            f"SELECT COUNT(*) AS cnt FROM request_log {where}",  # noqa: S608 - fixed ownership clause; values are bound
-            params,
-        )
+        if owner_user_id is None:
+            row = await self._select_one("SELECT COUNT(*) AS cnt FROM request_log")
+        else:
+            row = await self._select_one(
+                "SELECT COUNT(*) AS cnt FROM request_log WHERE api_key_id IN "
+                "(SELECT id FROM api_keys WHERE owner_user_id = ?)",
+                (owner_user_id,),
+            )
         return row["cnt"] if row else 0
 
     # ── Model fallbacks ───────────────────────────────────────────────

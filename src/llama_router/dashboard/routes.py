@@ -1119,13 +1119,11 @@ async def api_status(request: Request):
     admin_payload = dash_user is not None and dash_user.is_admin
     infos = await pm.list_provider_infos()
     all_models = await db.list_all_models()
-    log_total = (
-        await db.count_request_logs(
-            owner_user_id=None if admin_payload else dash_user.id
-        )
-        if dash_user is not None
-        else 0
-    )
+    log_total = 0
+    if admin_payload:
+        log_total = await db.count_request_logs()
+    elif dash_user is not None:
+        log_total = await db.count_request_logs(owner_user_id=dash_user.id)
 
     providers_data = [
         _provider_status_payload(info, admin=admin_payload) for info in infos

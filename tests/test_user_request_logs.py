@@ -37,9 +37,8 @@ async def test_log_ownership_filters_before_pagination(db: Database) -> None:
     assert await db.count_request_logs() == 5
 
 
-@pytest.mark.parametrize("page", ["1", "2", "-1", "invalid", "999"])
 async def test_dashboard_logs_and_live_count_are_user_scoped(
-    dash_client: tuple[httpx.AsyncClient, Database], page: str
+    dash_client: tuple[httpx.AsyncClient, Database],
 ) -> None:
     client, db = dash_client
     owner = await db.create_dashboard_user(
@@ -64,7 +63,7 @@ async def test_dashboard_logs_and_live_count_are_user_scoped(
         )
     await db.save_request_log(RequestLog(protocol="system", endpoint="/system-event"))
     client.cookies.set(AUTH_COOKIE, sign_session(owner, settings.session_secret))
-    response = await client.get(f"/?log_page={page}&owner_user_id={other}")
+    response = await client.get(f"/?owner_user_id={other}")
     assert response.status_code == 200
     assert 'id="log-pane"' in response.text
     assert "/unique-request-0" in response.text
@@ -95,3 +94,46 @@ async def test_dashboard_logs_and_live_count_are_user_scoped(
     assert "No requests logged for your current API keys yet." in response.text
     assert "/unique-request-0" not in response.text
     assert (await client.get("/api/status")).json()["log_total"] == 0
+
+
+@pytest.mark.parametrize("delete", ["admin", "owner", "user"])
+async def test_replacement_key_cannot_read_deleted_keys_logs(
+    db: Database, delete: str
+) -> None:
+    owner = await db.create_dashboard_user("owner", "unused", False)
+    other = await db.create_dashboard_user("other", "unused", False)
+    key = await db.create_api_key("old", "old", "balanced", True, owner_user_id=owner)
+    await db.save_request_log(
+        RequestLog(protocol="ollama", endpoint="/private-request", api_key_id=key)
+    )
+    if delete == "admin":
+        await db.delete_api_key(key)
+    elif delete == "owner":
+        assert await db.delete_owned_api_key(key, owner)
+    else:
+        await db.delete_dashboard_user(owner)
+
+    replacement = await db.create_api_key(
+        "new", "new", "balanced", True, owner_user_id=other
+    )
+    assert replacement != key
+    assert await db.get_request_logs(owner_user_id=other) == []
+    assert await db.count_request_logs(owner_user_id=other) == 0
+    assert [r.endpoint for r in await db.get_request_logs()] == ["/private-request"]
+    assert await db.count_request_logs() == 1
+
+
+@pytest.mark.parametrize("page", ["1", "2", "-1", "invalid", "999"])
+async def test_dashboard_log_page_is_clamped(
+    dash_client: tuple[httpx.AsyncClient, Database], page: str
+) -> None:
+    client, db = dash_client
+    owner = await db.create_dashboard_user("owner", "unused", False)
+    key = await db.create_api_key("key", "key", "balanced", True, owner_user_id=owner)
+    await db.save_request_log(
+        RequestLog(protocol="ollama", endpoint="/only-request", api_key_id=key)
+    )
+    client.cookies.set(AUTH_COOKIE, sign_session(owner, settings.session_secret))
+    response = await client.get(f"/?log_page={page}")
+    assert response.status_code == 200
+    assert "/only-request" in response.text

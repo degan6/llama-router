@@ -115,6 +115,52 @@ def _alembic_cfg(sync_url: str):
     return cfg
 
 
+@pytest.mark.parametrize("keep_key", [False, True])
+def test_api_key_sequence_starts_above_retained_logs(
+    tmp_path: Path, keep_key: bool
+) -> None:
+    """Upgrade populated and empty key tables without reusing deleted key IDs."""
+    dbfile = tmp_path / "key_sequence.db"
+    sync_url = f"sqlite:///{dbfile}"
+    command.upgrade(_alembic_cfg(sync_url), "026_session_version")
+    with sqlite3.connect(dbfile) as con:
+        if keep_key:
+            con.execute(
+                "INSERT INTO api_keys (id, key_prefix, key_hash) "
+                "VALUES (1, 'kept', 'kept')"
+            )
+            con.execute(
+                "INSERT INTO api_key_decision_policies (api_key_id, policy) "
+                "VALUES (1, '{}')"
+            )
+        con.execute(
+            "INSERT INTO api_keys (id, key_prefix, key_hash) VALUES (9, 'old', 'old')"
+        )
+        con.execute(
+            "INSERT INTO request_log (protocol, endpoint, api_key_id) "
+            "VALUES ('ollama', '/private-request', 9)"
+        )
+        con.execute("DELETE FROM api_keys WHERE id = 9")
+
+    run_upgrade_sync(sync_url)
+    with sqlite3.connect(dbfile) as con:
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute("INSERT INTO api_keys (key_prefix, key_hash) VALUES ('new', 'new')")
+        assert con.execute(
+            "SELECT id FROM api_keys WHERE key_hash = 'new'"
+        ).fetchone() == (10,)
+        assert con.execute("SELECT api_key_id FROM request_log").fetchall() == [(9,)]
+        if keep_key:
+            assert con.execute(
+                "SELECT policy FROM api_key_decision_policies"
+            ).fetchall() == [("{}",)]
+            con.execute("DELETE FROM api_keys WHERE id = 1")
+            assert (
+                con.execute("SELECT * FROM api_key_decision_policies").fetchall() == []
+            )
+        assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_upgrade_from_wireguard_schema_keeps_providers(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
