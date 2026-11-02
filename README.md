@@ -511,7 +511,7 @@ Each provider can also carry extra headers (one `Name: value` per line) and mode
 
 ## Single sign-on (OpenID Connect)
 
-The dashboard can sign people in through an OpenID Connect provider such as Authentik, Keycloak, Okta, Entra ID or dex. Members of an admin group become administrators. Everyone else who signs in is a read-only viewer who may chat and [issue themselves API keys](#keys-users-issue-themselves). Local accounts keep working alongside SSO unless you turn password sign-in off.
+The dashboard can sign people in through an OpenID Connect provider such as Authentik, Keycloak, Okta, Entra ID or dex. Members of an admin group become administrators. Everyone else who signs in is a read-only viewer who may chat and [issue themselves API keys](#keys-users-issue-themselves). The **Log** tab shows viewers only requests made with their own current API keys; requests without a key or with a deleted key remain admin-only. Backend error details are shown only to admins. Local accounts keep working alongside SSO unless you turn password sign-in off.
 
 Register a confidential client at your provider with this redirect URI:
 
