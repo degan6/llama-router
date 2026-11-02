@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Security - llama-router{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0"><i class="bi bi-shield-lock me-2"></i>Security</h2>
+    <a class="btn btn-sm btn-outline-secondary" href="/security"><i class="bi bi-arrow-clockwise me-1"></i>Refresh</a>
+</div>
+{% if request.query_params.get('reset') == '1' %}
+<div class="alert alert-success" role="status">Login limits reset. The address can try signing in again.</div>
+{% endif %}
+<div class="card">
+    <div class="card-header"><h5 class="mb-0">Password login limits</h5></div>
+    <div class="card-body">
+        <p class="text-muted">Limits apply to an IP address and affect everyone signing in from that address. Reset clears its attempt budget, cooldown, and escalation history.</p>
+        <p class="small text-muted">New cooldowns and administrator resets appear in the <a href="/#log-pane">Log tab</a>. Existing sessions remain usable during a cooldown.</p>
+        {% if login_limits %}
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead><tr><th>IP address</th><th>Status</th><th>Last cooldown</th><th title="After cooldown, an hour without login attempts resets escalation">Escalation resets in</th><th></th></tr></thead>
+                <tbody>
+                {% for limit in login_limits %}
+                <tr>
+                    <td><code>{{ limit.client_ip }}</code></td>
+                    <td>{% if limit.retry_after %}<span class="badge text-bg-warning">Blocked</span> {{ limit.retry_after }} seconds remaining{% else %}<span class="badge text-bg-success">No active cooldown</span>{% endif %}</td>
+                    <td class="text-nowrap">{{ limit.cooldown_seconds }} seconds</td>
+                    <td class="text-nowrap">{{ limit.reset_after }} seconds</td>
+                    <td class="text-end">
+                        <form method="post" action="/security/reset" onsubmit="return confirm('Clear all login limits for this IP address?');">
+                            <input type="hidden" name="client_ip" value="{{ limit.client_ip }}">
+                            <button class="btn btn-sm btn-outline-warning text-nowrap" type="submit">Reset limits</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-muted mb-0">No login cooldowns or escalation history.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

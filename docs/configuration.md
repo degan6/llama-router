@@ -50,6 +50,13 @@ ends, the next attempt starts a fresh budget. One hour without login attempts
 after the cooldown resets escalation. Successful sign-ins count as attempts
 and do not reset escalation. Existing sessions and OIDC sign-in are unaffected.
 
+Administrators can use the **Security** tab to reset one IP's attempt budget,
+cooldown, and escalation history. Each new cooldown and administrator reset
+appears in the dashboard **Log** tab and server logs; repeated requests during
+the same cooldown do not add duplicate entries. Passwords and submitted
+usernames are not recorded. The Security tab shows current cooldowns and
+retained escalation history; use Refresh to update the remaining times.
+
 Counters are in memory per process and reset on restart. The store retains at
 most 10,000 addresses until their attempt window and idle reset have expired;
 when full, new addresses receive 429 until a retained address expires. Active entries are never evicted to

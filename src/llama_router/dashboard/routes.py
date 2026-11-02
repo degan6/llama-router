@@ -36,6 +36,7 @@ from ..models import ProviderProtocol, RequestLog
 from ..probe import FAMILY_LABELS, BlockedAddressError, probe_url
 from ..provider_manager import preset_settings
 from ..provider_secrets import format_extra_headers, parse_extra_headers
+from ..request_logger import log_request
 from ..router import (
     ENDPOINT_PROTOCOLS,
     ROUTING_MODES,
@@ -533,8 +534,25 @@ async def login_submit(
     db = deps.get_db()
     if await db.count_dashboard_users() == 0:
         return RedirectResponse(url="/", status_code=302)
-    retry_after = login_attempt_limiter.reserve(client_ip(request))
+    address = client_ip(request)
+    was_blocked = login_attempt_limiter.is_blocked(address)
+    retry_after = login_attempt_limiter.reserve(address)
     if retry_after:
+        if not was_blocked and login_attempt_limiter.is_blocked(address):
+            detail = f"HTTP 429: Password sign-in blocked for {retry_after} seconds"
+            logger.warning("%s (client %s)", detail, address)
+            await log_request(
+                db,
+                provider=None,
+                protocol="dashboard",
+                endpoint="/login",
+                request=request,
+                model=None,
+                duration_ms=0.0,
+                status="error",
+                error_detail=detail,
+                request_meta=f"Login cooldown: {retry_after} seconds",
+            )
         return PlainTextResponse(
             "Too many sign-in attempts. Please try again later.",
             status_code=429,

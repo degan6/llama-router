@@ -515,7 +515,9 @@ Local password sign-in allows 120 attempts per client IP address within five
 minutes by default, including successful sign-ins. Repeated limit hits trigger
 cooldowns of 5, 10, 20, 40, then at most 60 minutes, returning HTTP 429 with a
 retry delay. An hour without attempts after cooldown resets escalation. See
-[dashboard sign-in configuration](docs/configuration.md#dashboard-sign-in) for settings and proxy/multiple-process deployment details.
+[dashboard sign-in configuration](docs/configuration.md#dashboard-sign-in) for settings and proxy/multiple-process deployment details. Administrators can
+reset an IP's limits from the **Security** tab. New cooldowns and admin resets
+appear in the **Log** tab and server logs.
 
 The dashboard can sign people in through an OpenID Connect provider such as Authentik, Keycloak, Okta, Entra ID or dex. Members of an admin group become administrators. Everyone else who signs in is a read-only viewer who may chat and [issue themselves API keys](#keys-users-issue-themselves). Local accounts keep working alongside SSO unless you turn password sign-in off.
 

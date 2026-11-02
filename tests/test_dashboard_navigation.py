@@ -56,8 +56,10 @@ async def test_navigation_stays_consistent_across_pages(
     pages = ["/", "/chat", "/my-keys", "/decisions", f"/providers/{provider.id}"]
     expected = ["/#providers-pane", "/#benchmarks-pane", "/#models-pane", "/chat"]
     if role != "viewer":
-        pages.append("/users")
-        expected.extend(["/users", "/#keys-pane", "/#workers-pane", "/#log-pane"])
+        pages.extend(["/users", "/security"])
+        expected.extend(
+            ["/users", "/security", "/#keys-pane", "/#workers-pane", "/#log-pane"]
+        )
         if cache is not None:
             expected.append("/#cache-pane")
 
@@ -76,7 +78,7 @@ async def test_navigation_stays_consistent_across_pages(
         active = [
             item for item in items if "active" in (item.get("class") or "").split()
         ]
-        if path in ("/", "/chat", "/users"):
+        if path in ("/", "/chat", "/users", "/security"):
             assert len(active) == 1, path
             assert active[0].get("href") == path or (
                 path == "/" and active[0].get("data-bs-target") == "#providers-pane"

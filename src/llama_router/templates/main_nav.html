@@ -20,7 +20,10 @@
 {{ pane('benchmarks', 'Benchmarks', 'speedometer') }}
 {{ pane('models', 'Models', 'cpu') }}
 {{ page_link('/chat', 'Chat', 'chat-dots') }}
-{% if show_users_tab %}{{ page_link('/users', 'Users', 'people') }}{% endif %}
+{% if show_users_tab %}
+{{ page_link('/users', 'Users', 'people') }}
+{{ page_link('/security', 'Security', 'shield-lock') }}
+{% endif %}
 {% if show_api_keys %}{{ pane('keys', 'API Keys', 'key') }}{% endif %}
 {% if show_workers %}{{ pane('workers', 'Workers', 'diagram-3') }}{% endif %}
 {% if show_log %}{{ pane('log', 'Log', 'journal-text', badge=true) }}{% endif %}

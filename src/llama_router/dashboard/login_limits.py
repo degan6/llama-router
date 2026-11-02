@@ -20,6 +20,16 @@ class _Window:
     blocked_until: float = 0.0
 
 
+@dataclass(frozen=True)
+class LoginLimit:
+    """An address with a current cooldown or retained escalation history."""
+
+    client_ip: str
+    retry_after: int
+    cooldown_seconds: int
+    reset_after: int
+
+
 class LoginAttemptLimiter:
     """Reserve attempts synchronously before any credential lookup or hashing.
 
@@ -81,3 +91,26 @@ class LoginAttemptLimiter:
         window.attempts += 1
         window.reset_at = now + _RESET_SECONDS
         return 0
+
+    def is_blocked(self, client_ip: str) -> bool:
+        """Whether an address is already serving a cooldown."""
+        window = self._windows.get(client_ip)
+        return window is not None and window.blocked_until > self._clock()
+
+    def limited_addresses(self) -> list[LoginLimit]:
+        """Current cooldowns and escalation history, without changing budgets."""
+        now = self._clock()
+        return [
+            LoginLimit(
+                client_ip=ip,
+                retry_after=max(0, math.ceil(window.blocked_until - now)),
+                cooldown_seconds=window.cooldown_seconds,
+                reset_after=math.ceil(window.reset_at - now),
+            )
+            for ip, window in sorted(self._windows.items())
+            if window.cooldown_seconds and window.reset_at > now
+        ]
+
+    def reset(self, client_ip: str) -> bool:
+        """Clear one address's attempt budget, cooldown, and escalation history."""
+        return self._windows.pop(client_ip, None) is not None

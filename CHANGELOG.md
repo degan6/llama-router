@@ -9,6 +9,10 @@ described in their git tags and GitHub Releases.
 
 ### Added
 
+- Administrator Security tab lists IP cooldowns and escalation history, with
+  a reset action for one address. New cooldowns and administrator resets are
+  recorded in the dashboard Log tab and server logs.
+
 - Dashboard password sign-in now limits attempts by client address,
   returning HTTP 429 with `Retry-After` during cooldown. Defaults allow 120
   attempts per address in five minutes. Repeated limit hits double cooldowns
