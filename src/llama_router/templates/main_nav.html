@@ -19,6 +19,7 @@
 {{ pane('providers', 'Providers', 'hdd-stack') }}
 {{ pane('benchmarks', 'Benchmarks', 'speedometer') }}
 {{ pane('models', 'Models', 'cpu') }}
+{% if dash_user %}{{ page_link('/decisions', 'Decisions', 'signpost-split') }}{% endif %}
 {{ page_link('/chat', 'Chat', 'chat-dots') }}
 {% if show_users_tab %}{{ page_link('/users', 'Users', 'people') }}{% endif %}
 {% if show_api_keys %}{{ pane('keys', 'API Keys', 'key') }}{% endif %}
