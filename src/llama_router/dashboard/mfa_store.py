@@ -33,6 +33,7 @@ class LocalAccount:
     version: int
     enabled: bool
     password_tag: str
+    session_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,8 @@ class MfaStore:
 
     async def account(self, user_id: int) -> LocalAccount | None:
         row = await self.db._select_one(
-            "SELECT id, username, password_hash, mfa_version, mfa_enabled "
+            "SELECT id, username, password_hash, mfa_version, mfa_enabled, "
+            "session_version "
             "FROM dashboard_users WHERE id = ? AND auth_source = 'local'",
             (user_id,),
         )
@@ -72,6 +74,7 @@ class MfaStore:
             int(row["mfa_version"]),
             bool(row["mfa_enabled"]),
             digest(str(row["password_hash"])),
+            int(row["session_version"]),
         )
 
     async def credentials(self, user_id: int) -> list[Credential]:
@@ -103,7 +106,11 @@ class MfaStore:
 
     async def new_flow(self, account: LocalAccount, purpose: str, **state: str) -> str:
         token = secrets.token_urlsafe(32)
-        state.update(version=str(account.version), password_tag=account.password_tag)
+        state.update(
+            version=str(account.version),
+            password_tag=account.password_tag,
+            session_version=str(account.session_version),
+        )
         # Bound storage without a background cleanup service.
         await self.db._execute(
             "DELETE FROM dashboard_auth_flows WHERE expires_at <= ?",
@@ -189,9 +196,14 @@ class MfaStore:
         result = await session.execute(
             text(
                 "UPDATE dashboard_users SET mfa_version = mfa_version "
-                "WHERE id = :uid AND mfa_version = :version"
+                "WHERE id = :uid AND mfa_version = :version "
+                "AND session_version = :session_version"
             ),
-            {"uid": account.id, "version": account.version},
+            {
+                "uid": account.id,
+                "version": account.version,
+                "session_version": account.session_version,
+            },
         )
         return cursor_rowcount(result) == 1
 

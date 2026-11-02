@@ -569,3 +569,38 @@ def test_origin_normalizes_default_port_and_hostname() -> None:
         ).dashboard_webauthn_origin
         == "https://router.example"
     )
+
+
+async def test_session_revocation_invalidates_mfa_sessions_and_pending_login(
+    mfa_client: tuple[httpx.AsyncClient, Database],
+) -> None:
+    client, db = mfa_client
+    uid = await create_user(db)
+    await login(client)
+    authenticator = Authenticator()
+    assert (await enroll(client, authenticator)).status_code == 200
+    await db.bump_dashboard_user_session_version(uid)
+    assert (await client.get("/api/status")).status_code == 401
+    client.cookies.clear()
+    await login(client)
+    assert (await authenticate(client, authenticator)).status_code == 200
+    assert (await client.get("/api/status")).status_code == 200
+    client.cookies.clear()
+    await login(client)
+    start = await client.post(
+        "/login/second-factor/authenticate/options", headers=HEADERS
+    )
+    assert start.status_code == 200
+    body = start.json()
+    await db.bump_dashboard_user_session_version(uid)
+    response = await client.post(
+        "/login/second-factor/authenticate/verify",
+        json={
+            "token": body["token"],
+            "credential": authenticator.response(
+                body["options"]["challenge"], register=False, count=3
+            ),
+        },
+        headers=HEADERS,
+    )
+    assert response.status_code == 401

@@ -38,7 +38,7 @@ from ..config import settings
 from . import deps
 from .auth_core import AUTH_COOKIE, SESSION_MAX_AGE, session_claims, sign_session
 from .mfa_store import FLOW_TTL, Credential, Flow, LocalAccount, MfaStore, digest
-from .routes import merge_dash_template_ctx, templates
+from .routes import _cookie_secure, merge_dash_template_ctx, templates
 
 router = APIRouter()
 PENDING_COOKIE = "lr_second_factor"
@@ -94,6 +94,7 @@ async def _valid_flow(token: str, purpose: str) -> tuple[Flow, LocalAccount]:
         or account is None
         or flow.state["version"] != str(account.version)
         or flow.state["password_tag"] != account.password_tag
+        or flow.state.get("session_version") != str(account.session_version)
     ):
         raise HTTPException(401, "Sign-in expired. Sign in again.")
     return flow, account
@@ -110,6 +111,8 @@ async def _session_account(request: Request, *, recent: bool = False) -> LocalAc
     if (
         account is None
         or claims is None
+        or claims.version != account.session_version
+        or claims.username != account.username
         or claims.mfa_version != account.version
         or (account.enabled and not claims.mfa_verified)
     ):
@@ -120,17 +123,22 @@ async def _session_account(request: Request, *, recent: bool = False) -> LocalAc
 
 
 async def _set_session(
-    response: Response, account: LocalAccount, *, verified: bool
+    request: Request, response: Response, account: LocalAccount, *, verified: bool
 ) -> None:
     secret = await deps.get_dashboard_session_secret()
     response.set_cookie(
         AUTH_COOKIE,
         sign_session(
-            account.id, secret, mfa_version=account.version, mfa_verified=verified
+            account.id,
+            secret,
+            account.session_version,
+            account.username,
+            mfa_version=account.version,
+            mfa_verified=verified,
         ),
         httponly=True,
         samesite="lax",
-        secure=settings.dashboard_cookie_secure
+        secure=_cookie_secure(request)
         or settings.dashboard_webauthn_origin.startswith("https://"),
         max_age=SESSION_MAX_AGE,
     )
@@ -155,7 +163,7 @@ async def password_login_response(
         raise HTTPException(403, "Sign in from the configured dashboard origin")
     if not account.enabled and not settings.dashboard_require_second_factor:
         response = RedirectResponse(next_url, status_code=303)
-        await _set_session(response, account, verified=False)
+        await _set_session(request, response, account, verified=False)
         return response
     token = await store.new_flow(
         account,
@@ -170,7 +178,7 @@ async def password_login_response(
         token,
         httponly=True,
         samesite="strict",
-        secure=settings.dashboard_cookie_secure
+        secure=_cookie_secure(request)
         or settings.dashboard_webauthn_origin.startswith("https://"),
         max_age=FLOW_TTL,
     )
@@ -305,7 +313,7 @@ async def registration_verify(request: Request, body: CeremonyFinish) -> Respons
     response = JSONResponse(
         {"ok": True, "recovery_codes": codes, "next": "/account/security"}
     )
-    await _set_session(response, updated, verified=True)
+    await _set_session(request, response, updated, verified=True)
     return response
 
 
@@ -374,7 +382,7 @@ async def authentication_verify(request: Request, body: CeremonyFinish) -> Respo
     ):
         raise HTTPException(401, "Challenge expired. Sign in again.")
     response = JSONResponse({"ok": True, "next": pending.state["next"]})
-    await _set_session(response, account, verified=True)
+    await _set_session(request, response, account, verified=True)
     return response
 
 
@@ -387,7 +395,7 @@ async def recovery_login(request: Request, body: RecoveryAttempt) -> Response:
     ):
         raise HTTPException(401, "Invalid recovery code. Sign in again.")
     response = JSONResponse({"ok": True, "next": "/account/security"})
-    await _set_session(response, account, verified=True)
+    await _set_session(request, response, account, verified=True)
     return response
 
 
@@ -416,5 +424,5 @@ async def remove_credential(request: Request, credential_id: str) -> Response:
     if updated is None:
         raise HTTPException(401, "Sign in again")
     response = JSONResponse({"ok": True})
-    await _set_session(response, updated, verified=True)
+    await _set_session(request, response, updated, verified=True)
     return response

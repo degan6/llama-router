@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     # log, so a container or load-balancer health check polling every few
     # seconds does not fill it. Failures are still logged.
     quiet_health_checks: bool = False
+    # Proxies whose X-Forwarded-For header is believed, as IPs or CIDRs
+    # separated by commas. Empty: the header is ignored and the TCP peer is
+    # the client.
+    trusted_proxies: str = ""
+    # Request log rows older than this many days are deleted (0 keeps them all).
+    request_log_retention_days: float = 30.0
+    # A read timeout on a request that asked for more output tokens than this
+    # is blamed on the request, not the provider, so it does not count
+    # toward the provider's circuit breaker.
+    circuit_timeout_max_tokens: int = 4096
     # Re-probe a provider's endpoints when the last probe is older than this
     # (0 turns periodic re-probing off; probes on add, edit and recovery stay).
     probe_max_age_hours: float = 24.0
@@ -57,9 +67,48 @@ class Settings(BaseSettings):
     session_affinity_ttl_seconds: int = 1800
     # Most sessions remembered at once; the least recently used go first.
     session_affinity_max_sessions: int = 1000
+    # Most sessions one API key (or one client address, without a key) may
+    # hold, so one client cannot push everyone else's sessions out.
+    session_affinity_max_sessions_per_key: int = 200
     # Longest a key's decision policy (tiered routing, gates) may take before
     # the request goes on without it.
     decision_policy_timeout_seconds: float = 3.0
+    # Request limits (see limits.py). For the sizes and counts, 0 means no limit.
+    max_body_bytes: int = 10 * 1024 * 1024
+    """Largest request body on the API and dashboard ports; larger gets 413."""
+    max_media_body_bytes: int = 50 * 1024 * 1024
+    """Largest request body for the /v1/audio/ and /v1/images/ endpoints."""
+    max_n: int = 4
+    """``n`` and ``best_of`` on chat and completion requests are capped at this."""
+    max_tokens_cap: int = 32768
+    """Output-token fields (``max_tokens``, ``max_completion_tokens``,
+    ``max_output_tokens``, Ollama's ``num_predict``) are capped at this."""
+    upstream_max_concurrency: int = 256
+    """Upstream calls in flight at once across all clients."""
+    upstream_max_concurrency_per_key: int = 32
+    """Upstream calls in flight at once for one API key."""
+    upstream_queue_timeout_seconds: float = 30.0
+    """How long a request waits for a free upstream slot before 429."""
+    max_streams_per_key: int = 16
+    """Streamed responses open at once for one API key; more get 429."""
+    request_deadline_seconds: float = 1800.0
+    """A proxied request, streamed or not, must finish within this long of
+    arriving: 504 before the response starts, or the stream is ended."""
+    decision_policy_fail_open: bool = False
+    """When a policy with gates cannot be decided (no provider, an error, a
+    timeout), let the request through unchecked instead of refusing it with
+    503. A policy with only a tier always goes on with the requested model."""
+    decision_max_questions: int = 8
+    """Most questions in one decision request; each is a backend call."""
+    decision_max_state_chars: int = 32_000
+    """Longest state of a decision request, in characters. Every question
+    sends the whole state again."""
+    decision_max_concurrency: int = 4
+    """Questions of one decision request asked of the backend at once."""
+    # Spend caps: output tokens assumed for a priced cloud request that sets no
+    # max_tokens. The estimate is held against the key's cap while the request
+    # runs, and charged when the response reports no usage.
+    spend_estimate_completion_tokens: int = 4096
     # Prometheus metrics at GET /metrics on the dashboard port. Scrapers send
     # ``Authorization: Bearer <metrics_token>``; without a token the endpoint
     # needs a dashboard sign-in like the rest of the dashboard.
@@ -67,9 +116,17 @@ class Settings(BaseSettings):
     metrics_token: str = ""
     cache_enabled: bool = True
     cache_dir: str = "./model_cache"
-    cache_host: str = "0.0.0.0"  # noqa: S104  # containers bind all interfaces
+    cache_host: str = "127.0.0.1"
+    """Cache bind address. Loopback by default: the cache is unauthenticated
+    unless ``cache_token`` is set, so exposing it to the LAN is opt-in."""
     cache_port: int = 9200
     cache_external_host: str = ""
+    cache_token: str = ""
+    """When set, every cache request must send ``Authorization: Bearer <token>``.
+    Stock Ollama cannot send one; use it with a reverse proxy that adds it."""
+    cache_max_bytes: int = 0
+    """Upper bound on cached blob bytes; least recently used blobs are evicted
+    after each download to stay under it. 0 means unlimited."""
     cache_manifest_ttl_hours: int = 240
     cache_max_concurrent_blobs: int = 4
     sentry_dsn: str = ""
@@ -90,6 +147,22 @@ class Settings(BaseSettings):
     # Sent as API-KEY to the local upstream when it requires one.
     worker_upstream_api_key: str = ""
     worker_max_concurrency: int = 4
+    # Worker: request bodies buffered at once across all jobs from the hub.
+    # Jobs whose bodies would go over it are refused with 503.
+    worker_max_body_bytes_in_flight: int = 256 * 1024 * 1024
+    # Hub: response bytes held per job waiting for the client to read them.
+    # When full the hub stops reading from that worker until there is room;
+    # a job that stays full for 30 seconds is failed.
+    worker_response_buffer_bytes: int = 16 * 1024 * 1024
+    # Hub: largest response one job may send back from a worker.
+    worker_max_response_bytes: int = 1024 * 1024 * 1024
+    # Hub: providers one worker may share individually.
+    worker_max_shared_providers: int = 256
+    # Hub: provider lists from one worker are applied at most this often.
+    worker_catalog_min_interval_seconds: float = 5.0
+    # Hub: providers a worker stopped sharing are deleted after this long
+    # (0 keeps them until removed by hand).
+    worker_unshared_purge_hours: float = 24.0
     # Allow the hub to pull and delete models on this worker.
     worker_allow_admin: bool = False
     # How the hub sees this worker's providers: "combined" (one provider) or
@@ -101,11 +174,32 @@ class Settings(BaseSettings):
     hf_models_dir: str = "./hf_models"
     # If set, signs dashboard session cookies; otherwise persisted in app_settings.
     session_secret: str = ""
-    # Set true behind HTTPS so session cookies are only sent over TLS.
+    # Without session_secret, a random secret is generated and kept in this
+    # file (mode 0600) to encrypt provider keys and pepper client key hashes.
+    # Empty: secret.key in the directory holding database_path.
+    secret_key_path: str = ""
+    # Always mark session cookies Secure (sent over TLS only). Without it they
+    # are Secure whenever the request came over HTTPS, directly or through a
+    # proxy that sets X-Forwarded-Proto: https.
     dashboard_cookie_secure: bool = False
     # Fixed external origin for WebAuthn; never derive it from proxy headers.
     dashboard_webauthn_origin: str = ""
     dashboard_require_second_factor: bool = False
+    # Comma-separated extra origins (https://llm.example.org) allowed to send
+    # state-changing requests to the dashboard. Needed only behind a plain
+    # HTTP proxy that rewrites Host without setting X-Forwarded-Host; the
+    # OIDC redirect base URL is always trusted.
+    dashboard_trusted_origins: str = ""
+    # The first dashboard administrator, created at startup when there are no
+    # dashboard accounts yet; ignored once any account exists. There is no way
+    # to create the first account from the web.
+    admin_username: str = ""
+    admin_password: str = ""
+    # Most API keys one dashboard user may issue themselves on /my-keys
+    # (0: no limit). Keys an admin issues on the API Keys tab don't count.
+    max_api_keys_per_user: int = 20
+    # Most chat conversations one dashboard user may keep (0: no limit).
+    max_chat_conversations_per_user: int = 500
     # OpenID Connect sign-in for the dashboard. An empty issuer turns it off.
     oidc_issuer: str = ""
     oidc_client_id: str = ""
@@ -118,6 +212,9 @@ class Settings(BaseSettings):
     oidc_admin_group: str = ""
     # If set, only members of this group may sign in at all.
     oidc_allowed_group: str = ""
+    # New single sign-on accounts wait for an administrator to approve them
+    # on the Users page before they can use the dashboard.
+    oidc_require_approval: bool = False
     # External base URL of the dashboard, e.g. https://llm.example.org. The
     # callback is {base}/login/oidc/callback. Empty uses the request's host.
     oidc_redirect_base_url: str = ""
