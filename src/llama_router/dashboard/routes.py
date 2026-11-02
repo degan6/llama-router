@@ -335,7 +335,7 @@ def template_auth_ctx(request: Request) -> dict[str, Any]:
         "read_only": not adm,
         "show_api_keys": adm,
         "show_workers": adm,
-        "show_log": adm,
+        "show_log": True,
         "show_cache": adm,
         "show_users_tab": adm,
         "dash_user": user,
@@ -897,10 +897,6 @@ async def dashboard(request: Request):
             "chaos": [],
         }
         routing_summary = None
-        log_page = 1
-        log_pages = 1
-        log_total = 0
-        log_entries: list[Any] = []
         cache_stats = None
         cached_models: set[str] = set()
         workers: list[dict[str, Any]] = []
@@ -980,14 +976,6 @@ async def dashboard(request: Request):
         }
         routing_summary = _routing_summary(pm)
 
-        log_page = int(request.query_params.get("log_page", "1"))
-        log_per_page = 100
-        log_total = await db.count_request_logs()
-        log_entries = await db.get_request_logs(
-            limit=log_per_page, offset=(log_page - 1) * log_per_page
-        )
-        log_pages = max(1, (log_total + log_per_page - 1) // log_per_page)
-
         cache = deps.get_cache()
         cache_stats = cache.stats() if cache else None
         if cache_stats is not None:
@@ -996,6 +984,26 @@ async def dashboard(request: Request):
 
         workers = await _worker_rows(db, pm)
         worker_link_status = await deps.get_worker_link().status()
+
+    log_page = 1
+    log_pages = 1
+    log_total = 0
+    log_entries: list[RequestLog] = []
+    if dash["show_log"]:
+        owner_user_id = dash["dash_user"].id if read_only else None
+        log_per_page = 100
+        log_total = await db.count_request_logs(owner_user_id=owner_user_id)
+        log_pages = max(1, (log_total + log_per_page - 1) // log_per_page)
+        try:
+            log_page = int(request.query_params.get("log_page", "1"))
+        except ValueError:
+            log_page = 1
+        log_page = max(1, min(log_page, log_pages))
+        log_entries = await db.get_request_logs(
+            limit=log_per_page,
+            offset=(log_page - 1) * log_per_page,
+            owner_user_id=owner_user_id,
+        )
 
     provider_model_names = {m["name"] for m in all_models}
     if not read_only:
@@ -1135,7 +1143,11 @@ async def api_status(request: Request):
     admin_payload = dash_user is not None and dash_user.is_admin
     infos = await pm.list_provider_infos()
     all_models = await db.list_all_models()
-    log_total = await db.count_request_logs() if admin_payload else 0
+    log_total = 0
+    if admin_payload:
+        log_total = await db.count_request_logs()
+    elif dash_user is not None:
+        log_total = await db.count_request_logs(owner_user_id=dash_user.id)
 
     providers_data = [
         _provider_status_payload(info, admin=admin_payload) for info in infos

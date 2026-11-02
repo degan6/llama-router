@@ -1437,6 +1437,9 @@
     <!-- ==================== LOG TAB ==================== -->
     {% if show_log %}
     <div class="tab-pane fade" id="log-pane" role="tabpanel" aria-labelledby="log-tab" tabindex="0">
+        {% if read_only %}
+        <p class="text-muted small">Requests made with your current API keys. Requests without a key or with a deleted key are not included.</p>
+        {% endif %}
         {% if log_entries %}
         <div class="card mb-3">
             <div class="card-body py-2">
@@ -1554,7 +1557,7 @@
                         <td>
                             {% if entry.status == 'ok' %}
                             <span class="badge bg-success">OK</span>
-                            {% elif entry.error_detail %}
+                            {% elif entry.error_detail and not read_only %}
                             <button class="badge bg-danger border-0" type="button" data-bs-toggle="collapse" data-bs-target="#error-detail-{{ entry.id }}" title="Click to view details">
                                 Error <i class="bi bi-chevron-expand ms-1"></i>
                             </button>
@@ -1563,7 +1566,7 @@
                             {% endif %}
                         </td>
                     </tr>
-                    {% if entry.status != 'ok' and entry.error_detail %}
+                    {% if entry.status != 'ok' and entry.error_detail and not read_only %}
                     <tr class="collapse table-danger log-error-row" id="error-detail-{{ entry.id }}" data-parent-id="{{ entry.id }}">
                         <td colspan="11" class="small py-2 px-3">
                             <strong>Error detail:</strong>
@@ -1603,7 +1606,7 @@
 
         {% else %}
         <div class="alert alert-info">
-            <i class="bi bi-info-circle me-2"></i>No requests logged yet. Requests through the Ollama or OpenAI APIs and provider events such as refreshes appear here.
+            <i class="bi bi-info-circle me-2"></i>{% if read_only %}No requests logged for your current API keys yet.{% else %}No requests logged yet. Requests through the Ollama or OpenAI APIs and provider events such as refreshes appear here.{% endif %}
         </div>
         {% endif %}
     </div>
