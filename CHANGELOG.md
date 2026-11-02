@@ -21,6 +21,8 @@ described in their git tags and GitHub Releases.
   existing password-only sessions. Configure a stable HTTPS origin with
   `LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN`; SSO and API-key authentication stay
   unchanged.
+- Move Decisions from the top banner to the shared dashboard navigation, immediately after Models.
+
 ## [0.27.0] - 2026-11-01
 
 ### Security
