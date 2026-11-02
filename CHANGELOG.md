@@ -7,6 +7,10 @@ described in their git tags and GitHub Releases.
 
 ## [Unreleased]
 
+### Changed
+
+- Move Decisions from the top banner to the shared dashboard navigation, immediately after Models.
+
 ## [0.27.0] - 2026-11-01
 
 ### Security
