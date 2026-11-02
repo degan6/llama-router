@@ -3,8 +3,8 @@
 import sqlalchemy as sa
 from alembic import op
 
-revision = "025_dashboard_mfa"
-down_revision = "024_api_key_owner"
+revision = "027_dashboard_mfa"
+down_revision = "026_session_version"
 branch_labels = None
 depends_on = None
 
@@ -13,11 +13,6 @@ def upgrade() -> None:
     inspector = sa.inspect(op.get_bind())
     columns = {c["name"] for c in inspector.get_columns("dashboard_users")}
     tables = set(inspector.get_table_names())
-    if "mfa_version" not in columns:
-        op.add_column(
-            "dashboard_users",
-            sa.Column("mfa_version", sa.Integer(), nullable=False, server_default="0"),
-        )
     if "mfa_enabled" not in columns:
         op.add_column(
             "dashboard_users",
@@ -74,4 +69,3 @@ def downgrade() -> None:
     op.drop_table("dashboard_credentials")
     with op.batch_alter_table("dashboard_users") as batch:
         batch.drop_column("mfa_enabled")
-        batch.drop_column("mfa_version")

@@ -36,9 +36,14 @@ from webauthn.helpers.structs import (
 
 from ..config import settings
 from . import deps
-from .auth_core import AUTH_COOKIE, SESSION_MAX_AGE, session_claims, sign_session
+from .auth_core import AUTH_COOKIE, unsign_session
 from .mfa_store import FLOW_TTL, Credential, Flow, LocalAccount, MfaStore, digest
-from .routes import _cookie_secure, merge_dash_template_ctx, templates
+from .routes import (
+    _cookie_secure,
+    _set_session_cookie,
+    merge_dash_template_ctx,
+    templates,
+)
 
 router = APIRouter()
 PENDING_COOKIE = "lr_second_factor"
@@ -69,7 +74,8 @@ def _origin() -> tuple[str, str]:
     host = urlsplit(origin).hostname
     if not origin or not host:
         raise HTTPException(
-            503, "Configure LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN to use WebAuthn"
+            status_code=503,
+            detail="Configure LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN to use WebAuthn",
         )
     return origin, host
 
@@ -82,21 +88,17 @@ def _csrf(request: Request) -> None:
         request.headers.get("x-llama-router-security") != "1"
         or request.headers.get("origin", origin) != origin
     ):
-        raise HTTPException(403, "Security requests must come from this dashboard")
+        raise HTTPException(
+            status_code=403, detail="Security requests must come from this dashboard"
+        )
 
 
 async def _valid_flow(token: str, purpose: str) -> tuple[Flow, LocalAccount]:
     store = MfaStore(deps.get_db())
     flow = await store.flow(token, purpose)
     account = await store.account(flow.user_id) if flow else None
-    if (
-        flow is None
-        or account is None
-        or flow.state["version"] != str(account.version)
-        or flow.state["password_tag"] != account.password_tag
-        or flow.state.get("session_version") != str(account.session_version)
-    ):
-        raise HTTPException(401, "Sign-in expired. Sign in again.")
+    if flow is None or account is None or flow.state["version"] != str(account.version):
+        raise HTTPException(status_code=401, detail="Sign-in expired. Sign in again.")
     return flow, account
 
 
@@ -106,19 +108,20 @@ async def _pending(request: Request) -> tuple[Flow, LocalAccount]:
 
 async def _session_account(request: Request, *, recent: bool = False) -> LocalAccount:
     secret = await deps.get_dashboard_session_secret()
-    claims = session_claims(request.cookies.get(AUTH_COOKIE, ""), secret)
+    claims = unsign_session(request.cookies.get(AUTH_COOKIE, ""), secret)
     account = await MfaStore(deps.get_db()).account(claims.user_id) if claims else None
     if (
         account is None
         or claims is None
-        or claims.version != account.session_version
+        or claims.version != account.version
         or claims.username != account.username
-        or claims.mfa_version != account.version
         or (account.enabled and not claims.mfa_verified)
     ):
-        raise HTTPException(403, "Sign in with a local account")
-    if recent and (time.time() - claims.authenticated_at > RECENT_AUTH_SECONDS):
-        raise HTTPException(403, "Sign in again before changing security settings")
+        raise HTTPException(status_code=403, detail="Sign in with a local account")
+    if recent and (time.time() - claims.issued_at > RECENT_AUTH_SECONDS):
+        raise HTTPException(
+            status_code=403, detail="Sign in again before changing security settings"
+        )
     return account
 
 
@@ -126,21 +129,16 @@ async def _set_session(
     request: Request, response: Response, account: LocalAccount, *, verified: bool
 ) -> None:
     secret = await deps.get_dashboard_session_secret()
-    response.set_cookie(
-        AUTH_COOKIE,
-        sign_session(
-            account.id,
-            secret,
-            account.session_version,
-            account.username,
-            mfa_version=account.version,
-            mfa_verified=verified,
-        ),
-        httponly=True,
-        samesite="lax",
-        secure=_cookie_secure(request)
-        or settings.dashboard_webauthn_origin.startswith("https://"),
-        max_age=SESSION_MAX_AGE,
+    _set_session_cookie(
+        request,
+        response,
+        {
+            "id": account.id,
+            "username": account.username,
+            "session_version": account.version,
+        },
+        secret,
+        mfa_verified=verified,
     )
     response.delete_cookie(PENDING_COOKIE)
     await deps.get_db().touch_dashboard_user_login(account.id)
@@ -148,19 +146,20 @@ async def _set_session(
 
 
 async def password_login_response(
-    request: Request, user_id: int, next_url: str
+    request: Request, user_id: int, next_url: str, *, session_version: int
 ) -> Response:
-    """Issue a session only when all required factors have been satisfied."""
     store = MfaStore(deps.get_db())
     account = await store.account(user_id)
-    if account is None:
-        raise HTTPException(401, "Invalid login")
+    if account is None or account.version != session_version:
+        raise HTTPException(status_code=401, detail="Invalid login")
     if (
         settings.dashboard_webauthn_origin
         and request.headers.get("origin", settings.dashboard_webauthn_origin)
         != settings.dashboard_webauthn_origin
     ):
-        raise HTTPException(403, "Sign in from the configured dashboard origin")
+        raise HTTPException(
+            status_code=403, detail="Sign in from the configured dashboard origin"
+        )
     if not account.enabled and not settings.dashboard_require_second_factor:
         response = RedirectResponse(next_url, status_code=303)
         await _set_session(request, response, account, verified=False)
@@ -225,7 +224,8 @@ async def _registration_account(request: Request) -> tuple[LocalAccount, str]:
         flow, account = await _pending(request)
         if flow.state["mode"] != "enroll" or account.enabled:
             raise HTTPException(
-                403, "Complete second factor before adding an authenticator"
+                status_code=403,
+                detail="Complete second factor before adding an authenticator",
             )
         return account, flow.token
     return await _session_account(request, recent=True), ""
@@ -280,7 +280,9 @@ async def registration_verify(request: Request, body: CeremonyFinish) -> Respons
     if owner.id != account.id or flow.state["pending"] != (
         digest(pending) if pending else ""
     ):
-        raise HTTPException(403, "Enrollment belongs to another sign-in")
+        raise HTTPException(
+            status_code=403, detail="Enrollment belongs to another sign-in"
+        )
     try:
         verified = verify_registration_response(
             credential=body.credential,
@@ -291,25 +293,30 @@ async def registration_verify(request: Request, body: CeremonyFinish) -> Respons
         )
     except (WebAuthnException, ValueError) as exc:
         raise HTTPException(
-            400, "Authenticator registration could not be verified"
+            status_code=400, detail="Authenticator registration could not be verified"
         ) from exc
     codes = _codes() if not account.enabled else []
     credential = Credential(
-        bytes_to_base64url(verified.credential_id),
-        account.id,
-        flow.state["name"],
-        bytes_to_base64url(verified.credential_public_key),
-        verified.sign_count,
+        id=bytes_to_base64url(verified.credential_id),
+        user_id=account.id,
+        name=flow.state["name"],
+        public_key=bytes_to_base64url(verified.credential_public_key),
+        sign_count=verified.sign_count,
     )
     store = MfaStore(deps.get_db())
     try:
         saved = await store.register(flow, account, credential, codes)
     except IntegrityError as exc:
-        raise HTTPException(409, "This authenticator is already registered") from exc
+        raise HTTPException(
+            status_code=409, detail="This authenticator is already registered"
+        ) from exc
     if not saved:
-        raise HTTPException(401, "Enrollment expired. Sign in again.")
+        raise HTTPException(
+            status_code=401, detail="Enrollment expired. Sign in again."
+        )
     updated = await store.account(account.id)
-    assert updated is not None  # account row is locked during registration  # noqa: S101
+    if updated is None:
+        raise HTTPException(status_code=401, detail="Sign in again")
     response = JSONResponse(
         {"ok": True, "recovery_codes": codes, "next": "/account/security"}
     )
@@ -322,7 +329,7 @@ async def authentication_options(request: Request) -> Response:
     _csrf(request)
     pending, account = await _pending(request)
     if not account.enabled:
-        raise HTTPException(403, "Enroll an authenticator first")
+        raise HTTPException(status_code=403, detail="Enroll an authenticator first")
     origin, rp_id = _origin()
     store = MfaStore(deps.get_db())
     credentials = await store.credentials(account.id)
@@ -357,7 +364,9 @@ async def authentication_verify(request: Request, body: CeremonyFinish) -> Respo
         or flow.state["pending"] != digest(pending.token)
         or not account.enabled
     ):
-        raise HTTPException(403, "Challenge belongs to another sign-in")
+        raise HTTPException(
+            status_code=403, detail="Challenge belongs to another sign-in"
+        )
     store = MfaStore(deps.get_db())
     try:
         parsed = parse_authentication_credential_json(body.credential)
@@ -376,11 +385,13 @@ async def authentication_verify(request: Request, body: CeremonyFinish) -> Respo
             require_user_verification=True,
         )
     except (WebAuthnException, ValueError) as exc:
-        raise HTTPException(400, "Second factor could not be verified") from exc
+        raise HTTPException(
+            status_code=400, detail="Second factor could not be verified"
+        ) from exc
     if not await store.finish_authentication(
         flow, account, credential=credential, sign_count=verified.new_sign_count
     ):
-        raise HTTPException(401, "Challenge expired. Sign in again.")
+        raise HTTPException(status_code=401, detail="Challenge expired. Sign in again.")
     response = JSONResponse({"ok": True, "next": pending.state["next"]})
     await _set_session(request, response, account, verified=True)
     return response
@@ -393,7 +404,9 @@ async def recovery_login(request: Request, body: RecoveryAttempt) -> Response:
     if not account.enabled or not await MfaStore(deps.get_db()).finish_authentication(
         pending, account, recovery_code=body.code
     ):
-        raise HTTPException(401, "Invalid recovery code. Sign in again.")
+        raise HTTPException(
+            status_code=401, detail="Invalid recovery code. Sign in again."
+        )
     response = JSONResponse({"ok": True, "next": "/account/security"})
     await _set_session(request, response, account, verified=True)
     return response
@@ -404,10 +417,10 @@ async def regenerate_codes(request: Request) -> Response:
     _csrf(request)
     account = await _session_account(request, recent=True)
     if not account.enabled:
-        raise HTTPException(400, "Register an authenticator first")
+        raise HTTPException(status_code=400, detail="Register an authenticator first")
     codes = _codes()
     if not await MfaStore(deps.get_db()).replace_codes(account, codes):
-        raise HTTPException(401, "Sign in again")
+        raise HTTPException(status_code=401, detail="Sign in again")
     return _private(JSONResponse({"recovery_codes": codes}))
 
 
@@ -417,12 +430,12 @@ async def remove_credential(request: Request, credential_id: str) -> Response:
     account = await _session_account(request, recent=True)
     if not await MfaStore(deps.get_db()).delete_credential(account, credential_id):
         raise HTTPException(
-            400,
-            "Keep at least one authenticator; register a replacement first",
+            status_code=400,
+            detail="Keep at least one authenticator; register a replacement first",
         )
     updated = await MfaStore(deps.get_db()).account(account.id)
     if updated is None:
-        raise HTTPException(401, "Sign in again")
+        raise HTTPException(status_code=401, detail="Sign in again")
     response = JSONResponse({"ok": True})
     await _set_session(request, response, updated, verified=True)
     return response

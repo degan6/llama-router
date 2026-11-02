@@ -12,6 +12,8 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
+from fastapi import Request
+from fastapi.responses import Response
 from webauthn import base64url_to_bytes
 from webauthn.helpers import bytes_to_base64url
 
@@ -148,7 +150,12 @@ async def enroll(
 
 
 async def authenticate(
-    client: httpx.AsyncClient, authenticator: Authenticator, **kwargs: str | bool | int
+    client: httpx.AsyncClient,
+    authenticator: Authenticator,
+    *,
+    origin: str = ORIGIN,
+    uv: bool = True,
+    count: int = 2,
 ) -> httpx.Response:
     start = await client.post(
         "/login/second-factor/authenticate/options", json={}, headers=HEADERS
@@ -156,13 +163,12 @@ async def authenticate(
     assert start.status_code == 200, start.text
     body = start.json()
     assert body["options"]["userVerification"] == "required"
-    # Explicit arguments keep the virtual authenticator strongly typed.
     credential = authenticator.response(
         body["options"]["challenge"],
         register=False,
-        origin=str(kwargs.get("origin", ORIGIN)),
-        uv=bool(kwargs.get("uv", True)),
-        count=int(kwargs.get("count", 2)),
+        origin=origin,
+        uv=uv,
+        count=count,
     )
     return await client.post(
         "/login/second-factor/authenticate/verify",
@@ -604,3 +610,46 @@ async def test_session_revocation_invalidates_mfa_sessions_and_pending_login(
         headers=HEADERS,
     )
     assert response.status_code == 401
+
+
+async def test_own_password_change_keeps_verified_session_and_revokes_old_cookie(
+    mfa_client: tuple[httpx.AsyncClient, Database],
+) -> None:
+    client, db = mfa_client
+    uid = await create_user(db)
+    await login(client)
+    await enroll(client, Authenticator())
+    old_cookie = client.cookies[AUTH_COOKIE]
+    response = await client.post(
+        f"/users/{uid}/password", data={"new_password": PASSWORD}
+    )
+    assert response.status_code == 303
+    assert (await client.get("/api/status")).status_code == 200
+    assert (await client.get("/account/security")).status_code == 200
+    response = await client.get(
+        "/api/status", headers={"Cookie": f"{AUTH_COOKIE}={old_cookie}"}
+    )
+    assert response.status_code == 401
+
+
+async def test_password_change_during_login_invalidates_password_proof(
+    mfa_client: tuple[httpx.AsyncClient, Database], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from llama_router.dashboard import mfa
+
+    client, db = mfa_client
+    uid = await create_user(db)
+    original = mfa.password_login_response
+
+    async def changed_password(
+        request: Request, user_id: int, next_url: str, *, session_version: int
+    ) -> Response:
+        await db.update_dashboard_user_password(uid, hash_password("new-password"))
+        return await original(
+            request, user_id, next_url, session_version=session_version
+        )
+
+    monkeypatch.setattr(mfa, "password_login_response", changed_password)
+    assert (await login(client)).status_code == 401
+    assert AUTH_COOKIE not in client.cookies
+    assert PENDING_COOKIE not in client.cookies

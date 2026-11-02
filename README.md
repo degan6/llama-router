@@ -532,7 +532,8 @@ With enforcement enabled, **every local user, including administrators, must
 complete second factor**. Existing password-only sessions must sign in again.
 Users without a registered authenticator enter their password and go through
 restricted enrollment before getting dashboard access. Create the first
-administrator under Users as usual; protect that initial bootstrap access.
+administrator using `LLAMA_ROUTER_ADMIN_USERNAME` and
+`LLAMA_ROUTER_ADMIN_PASSWORD` before startup.
 SSO accounts continue to follow the identity provider's authentication policy.
 API keys and management keys keep their existing authentication.
 
@@ -563,9 +564,6 @@ with the same database configuration as the server. This deletes that user's
 WebAuthn credentials and recovery codes and revokes their sessions and pending
 logins. It leaves their password unchanged. If enforcement is enabled, the user
 must enroll again after entering their password.
-
-Authenticator-app codes (TOTP) are not included. Login rate limiting is a
-separate change.
 
 ## Single sign-on (OpenID Connect)
 

@@ -15,7 +15,7 @@ described in their git tags and GitHub Releases.
   and second-factor login for all local users, including admins, and rejects
   existing password-only sessions. Configure a stable HTTPS origin with
   `LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN`; SSO and API-key authentication stay
-  unchanged. Rate limiting is scoped separately.
+  unchanged.
 ## [0.27.0] - 2026-11-01
 
 ### Security

@@ -1899,7 +1899,6 @@ class Database:
         """Set the password and end every session of the account."""
         await self._execute(
             "UPDATE dashboard_users SET password_hash = ?, "
-            "mfa_version = mfa_version + 1, "
             "session_version = session_version + 1 WHERE id = ?",
             (password_hash, user_id),
         )
@@ -1989,7 +1988,7 @@ _SESSION_FLOOR_KEY = "dashboard_session_version_floor"
 _DASHBOARD_USER_COLUMNS = (
     "id, username, password_hash, is_admin, created_at, auth_source, "
     "oidc_issuer, oidc_subject, email, display_name, last_login_at, "
-    "mfa_enabled, mfa_version, "
+    "mfa_enabled, "
     "session_version, approved"
 )
 
@@ -2008,7 +2007,6 @@ def _row_to_dashboard_user(row: Mapping[str, Any]) -> dict:
         "display_name": row["display_name"],
         "last_login_at": row["last_login_at"],
         "mfa_enabled": bool(row["mfa_enabled"]),
-        "mfa_version": int(row["mfa_version"]),
         "session_version": int(row["session_version"] or 0),
         "approved": bool(row["approved"]),
     }

@@ -24,7 +24,7 @@ from .auth_core import (
     AUTH_COOKIE,
     DashboardUser,
     non_admin_forbidden_get_path,
-    session_claims,
+    unsign_session,
 )
 
 logger = logging.getLogger(__name__)
@@ -265,34 +265,21 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
 
         secret = await deps.get_dashboard_session_secret()
         raw = request.cookies.get(AUTH_COOKIE)
-        claims = session_claims(raw, secret) if raw else None
-        uid = claims.user_id if claims else None
+        session = unsign_session(raw, secret) if raw else None
         user: DashboardUser | None = None
-        if uid is not None:
-            row = await db.get_dashboard_user_by_id(uid)
-            if row and claims and not claims.valid_for(row):
-                row = None
-            if row and row.get("auth_source", "local") == "local":
-                from .mfa_store import MfaStore
-
-                account = await MfaStore(db).account(uid)
-                if (
-                    account is None
-                    or claims is None
-                    or claims.mfa_version != account.version
-                    or (
-                        (account.enabled or settings.dashboard_require_second_factor)
-                        and not claims.mfa_verified
-                    )
-                ):
-                    row = None
-            if row:
-                user = DashboardUser(
-                    id=row["id"],
-                    username=row["username"],
-                    is_admin=row["is_admin"],
-                    auth_source=row.get("auth_source") or "local",
+        if session is not None:
+            row = await db.get_dashboard_user_by_id(session.user_id)
+            if row and session.valid_for(row):
+                requires_mfa = row.get("auth_source", "local") == "local" and (
+                    row["mfa_enabled"] or settings.dashboard_require_second_factor
                 )
+                if not requires_mfa or session.mfa_verified:
+                    user = DashboardUser(
+                        id=row["id"],
+                        username=row["username"],
+                        is_admin=row["is_admin"],
+                        auth_source=row.get("auth_source") or "local",
+                    )
 
         if user is None:
             if path.startswith("/api/"):

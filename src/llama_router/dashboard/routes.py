@@ -20,6 +20,7 @@ from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
+    Response,
 )
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -459,14 +460,17 @@ def _cookie_secure(request: Request) -> bool:
     A client that fakes the header over plain HTTP only gets a cookie its
     own browser will not send back.
     """
-    if settings.dashboard_cookie_secure:
+    if (
+        settings.dashboard_cookie_secure
+        or settings.dashboard_webauthn_origin.startswith("https://")
+    ):
         return True
     return _external_origin(request)[0] == "https"
 
 
 def _set_session_cookie(
     request: Request,
-    resp: RedirectResponse,
+    resp: Response,
     user: dict[str, Any],
     secret: str,
     *,
@@ -479,7 +483,6 @@ def _set_session_cookie(
             secret,
             version=user.get("session_version") or 0,
             username=user["username"],
-            mfa_version=user.get("mfa_version") or 0,
             mfa_verified=mfa_verified,
         ),
         httponly=True,
@@ -564,7 +567,12 @@ async def login_submit(
     login_throttle.throttle.success(keys)
     from .mfa import password_login_response
 
-    return await password_login_response(request, row["id"], _safe_next_url(next))
+    return await password_login_response(
+        request,
+        row["id"],
+        _safe_next_url(next),
+        session_version=row["session_version"],
+    )
 
 
 def _login_throttled(request: Request, next_url: str, wait: float) -> HTMLResponse:
@@ -797,9 +805,9 @@ async def users_set_password(
         row = await db.get_dashboard_user_by_id(user_id)
         if row is not None:
             secret = await deps.get_dashboard_session_secret()
-            from .auth_core import session_claims
+            from .auth_core import unsign_session
 
-            claims = session_claims(request.cookies.get(AUTH_COOKIE, ""), secret)
+            claims = unsign_session(request.cookies.get(AUTH_COOKIE, ""), secret)
             _set_session_cookie(
                 request,
                 resp,

@@ -1,8 +1,4 @@
-"""Persistent, atomic WebAuthn state. Random tokens and recovery codes are hashed.
-
-SQLAlchemy result values are dynamically typed at the database boundary; convert
-all of them to the dataclasses here before passing them to authentication code.
-"""
+"""WebAuthn credentials, recovery codes and single-use sign-in challenges."""
 
 from __future__ import annotations
 
@@ -32,8 +28,6 @@ class LocalAccount:
     username: str
     version: int
     enabled: bool
-    password_tag: str
-    session_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,32 +43,26 @@ class Credential:
 class Flow:
     token: str
     user_id: int
-    purpose: str
     state: dict[str, str]
 
 
 class MfaStore:
-    """Use the router database and its existing transactional session factory."""
-
-    def __init__(self, db: Database):
+    def __init__(self, db: Database) -> None:
         self.db = db
 
     async def account(self, user_id: int) -> LocalAccount | None:
         row = await self.db._select_one(
-            "SELECT id, username, password_hash, mfa_version, mfa_enabled, "
-            "session_version "
+            "SELECT id, username, session_version, mfa_enabled "
             "FROM dashboard_users WHERE id = ? AND auth_source = 'local'",
             (user_id,),
         )
         if row is None:
             return None
         return LocalAccount(
-            int(row["id"]),
-            str(row["username"]),
-            int(row["mfa_version"]),
-            bool(row["mfa_enabled"]),
-            digest(str(row["password_hash"])),
-            int(row["session_version"]),
+            id=int(row["id"]),
+            username=str(row["username"]),
+            version=int(row["session_version"]),
+            enabled=bool(row["mfa_enabled"]),
         )
 
     async def credentials(self, user_id: int) -> list[Credential]:
@@ -84,11 +72,11 @@ class MfaStore:
         )
         return [
             Credential(
-                str(r["credential_id"]),
-                int(r["user_id"]),
-                str(r["name"]),
-                str(r["public_key"]),
-                int(r["sign_count"]),
+                id=str(r["credential_id"]),
+                user_id=int(r["user_id"]),
+                name=str(r["name"]),
+                public_key=str(r["public_key"]),
+                sign_count=int(r["sign_count"]),
             )
             for r in rows
         ]
@@ -102,16 +90,11 @@ class MfaStore:
         if row is None:
             return None
         state: dict[str, str] = json.loads(str(row["state"]))
-        return Flow(token, int(row["user_id"]), purpose, state)
+        return Flow(token=token, user_id=int(row["user_id"]), state=state)
 
     async def new_flow(self, account: LocalAccount, purpose: str, **state: str) -> str:
         token = secrets.token_urlsafe(32)
-        state.update(
-            version=str(account.version),
-            password_tag=account.password_tag,
-            session_version=str(account.session_version),
-        )
-        # Bound storage without a background cleanup service.
+        state["version"] = str(account.version)
         await self.db._execute(
             "DELETE FROM dashboard_auth_flows WHERE expires_at <= ?",
             (int(time.time()),),
@@ -129,10 +112,6 @@ class MfaStore:
             ),
         )
         return token
-
-    async def consume(self, session: AsyncSession, flow: Flow) -> bool:
-        """A conditional delete makes concurrent submissions single-use."""
-        return await self._consume_hash(session, digest(flow.token))
 
     async def _consume_hash(self, session: AsyncSession, token_hash: str) -> bool:
         result = await session.execute(
@@ -156,7 +135,7 @@ class MfaStore:
         async with self.db._require_session_factory()() as session, session.begin():
             if not await self._lock_account(session, account):
                 return False
-            if not await self.consume(session, flow):
+            if not await self._consume_hash(session, digest(flow.token)):
                 return False
             pending = flow.state.get("pending")
             if pending and not await self._consume_hash(session, pending):
@@ -195,14 +174,12 @@ class MfaStore:
         # UPDATE locks the account on all supported databases, including SQLite.
         result = await session.execute(
             text(
-                "UPDATE dashboard_users SET mfa_version = mfa_version "
-                "WHERE id = :uid AND mfa_version = :version "
-                "AND session_version = :session_version"
+                "UPDATE dashboard_users SET session_version = session_version "
+                "WHERE id = :uid AND session_version = :version"
             ),
             {
                 "uid": account.id,
                 "version": account.version,
-                "session_version": account.session_version,
             },
         )
         return cursor_rowcount(result) == 1
@@ -215,9 +192,9 @@ class MfaStore:
         codes: list[str],
     ) -> bool:
         async with self.db._require_session_factory()() as session, session.begin():
-            if not await self._lock_account(session, account) or not await self.consume(
-                session, flow
-            ):
+            if not await self._lock_account(
+                session, account
+            ) or not await self._consume_hash(session, digest(flow.token)):
                 return False
             # Initial forced enrollment must also consume the password proof.
             pending = flow.state.get("pending")
@@ -242,7 +219,7 @@ class MfaStore:
             await session.execute(
                 text(
                     "UPDATE dashboard_users SET mfa_enabled = 1, "
-                    "mfa_version = mfa_version + 1 WHERE id = :uid"
+                    "session_version = session_version + 1 WHERE id = :uid"
                 ),
                 {"uid": account.id},
             )
@@ -296,7 +273,8 @@ class MfaStore:
             if removed:
                 await session.execute(
                     text(
-                        "UPDATE dashboard_users SET mfa_version = mfa_version + 1 "
+                        "UPDATE dashboard_users "
+                        "SET session_version = session_version + 1 "
                         "WHERE id = :uid"
                     ),
                     {"uid": account.id},
@@ -309,7 +287,7 @@ class MfaStore:
             await session.execute(
                 text(
                     "UPDATE dashboard_users SET mfa_enabled = 0, "
-                    "mfa_version = mfa_version + 1 WHERE id = :uid"
+                    "session_version = session_version + 1 WHERE id = :uid"
                 ),
                 {"uid": user_id},
             )
