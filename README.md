@@ -509,6 +509,62 @@ Each provider can also carry extra headers (one `Name: value` per line) and mode
 - **Big catalogs.** A provider's **Model filter** (patterns such as `anthropic/claude-*`, one per line) keeps only the listed models that match; models added by hand are always kept. The OpenRouter preset starts with a filter for the main model families.
 - **Slow responses.** A provider's **Read timeout** replaces the default 120 seconds.
 
+## Second factor for local dashboard accounts
+
+Local accounts support password + WebAuthn without an SSO provider. Use a
+passkey (Touch ID, Windows Hello or a phone) or a security key supporting user
+verification with a PIN or biometrics. There is no rotating code to type.
+
+Serve the dashboard at a stable HTTPS hostname and configure:
+
+```dotenv
+LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN=https://llm.example.org
+LLAMA_ROUTER_DASHBOARD_COOKIE_SECURE=true
+LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR=true
+```
+
+The origin has no path or trailing slash. The server checks it explicitly;
+it never derives the WebAuthn identity from request or forwarded headers.
+HTTP is supported only on `localhost` for development. Changing the hostname
+requires registering authenticators again.
+
+With enforcement enabled, **every local user, including administrators, must
+complete second factor**. Existing password-only sessions must sign in again.
+Users without a registered authenticator enter their password and go through
+restricted enrollment before getting dashboard access. Create the first
+administrator using `LLAMA_ROUTER_ADMIN_USERNAME` and
+`LLAMA_ROUTER_ADMIN_PASSWORD` before startup.
+SSO accounts continue to follow the identity provider's authentication policy.
+API keys and management keys keep their existing authentication.
+
+Set `LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR=false` to make enrollment
+optional. Users can enroll on their **Profile**, opened by clicking their
+username. Once enrolled, that account always requires its second factor even
+when the global policy is optional. Turning the policy off does not remove anyone's authenticators.
+
+The profile page lets users register several named authenticators, remove a
+replaced device and generate recovery codes. Register a replacement before
+removing the last authenticator. Enrollment and device removal revoke older
+sessions.
+
+Save the ten recovery codes displayed after first enrollment. Each is a
+single-use alternative to WebAuthn **after entering the password**. Only hashes
+are stored; generating new codes invalidates the previous set. A recovery login
+opens the profile page so you can add a replacement device.
+
+If all devices and recovery codes are lost, an operator with access to the
+server can reset a local user's second factor:
+
+```bash
+docker compose exec llama-router llama-router --reset-dashboard-second-factor USERNAME
+```
+
+Outside Docker, run `llama-router --reset-dashboard-second-factor USERNAME`
+with the same database configuration as the server. This deletes that user's
+WebAuthn credentials and recovery codes and revokes their sessions and pending
+logins. It leaves their password unchanged. If enforcement is enabled, the user
+must enroll again after entering their password.
+
 ## Single sign-on (OpenID Connect)
 
 The dashboard can sign people in through an OpenID Connect provider such as Authentik, Keycloak, Okta, Entra ID or dex. Members of an admin group become administrators. Everyone else who signs in is a read-only viewer who may chat and [issue themselves API keys](#keys-users-issue-themselves). The **Log** tab shows viewers only requests made with their own current API keys; requests without a key or with a deleted key remain admin-only. Backend error details are shown only to admins. Local accounts keep working alongside SSO unless you turn password sign-in off.

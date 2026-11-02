@@ -575,3 +575,32 @@ def test_existing_install_keeps_anonymous_access(
         con.close()
     run_upgrade_sync(sync_url)
     assert _anonymous_setting(dbfile) == "true"
+
+
+def test_webauthn_upgrade_preserves_existing_account_security(tmp_path: Path) -> None:
+    dbfile = tmp_path / "before_webauthn.db"
+    sync_url = f"sqlite:///{dbfile}"
+    cfg = _alembic_cfg(sync_url)
+    command.upgrade(cfg, "027_api_key_autoincrement")
+    con = sqlite3.connect(dbfile)
+    try:
+        con.execute(
+            "INSERT INTO dashboard_users "
+            "(username, password_hash, is_admin, session_version, approved) "
+            "VALUES ('alice', 'existing-password-hash', 1, 7, 1)"
+        )
+        con.commit()
+    finally:
+        con.close()
+    run_upgrade_sync(sync_url)
+    con = sqlite3.connect(dbfile)
+    try:
+        assert con.execute(
+            "SELECT password_hash, session_version, approved, mfa_enabled "
+            "FROM dashboard_users WHERE username = 'alice'"
+        ).fetchone() == ("existing-password-hash", 7, 1, 0)
+        assert con.execute("SELECT version_num FROM alembic_version").fetchall() == [
+            (HEAD,)
+        ]
+    finally:
+        con.close()

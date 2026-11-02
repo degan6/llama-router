@@ -3,6 +3,7 @@
 
 {% block content %}
 <h2 class="mb-4"><i class="bi bi-people me-2"></i>Dashboard users</h2>
+<p class="text-muted">{% if mfa_required %}Second factor is required for all local accounts. Users must enroll before accessing the dashboard.{% else %}Second-factor enrollment is optional for local accounts. Enrolled users always need their second factor.{% endif %} SSO accounts follow the identity provider's policy.</p>
 
 {% if query_created %}
 <div class="alert alert-success py-2">User created.</div>
@@ -105,7 +106,7 @@
                             <tr>
                                 <td><code>{{ u.username }}</code>{% if u.display_name and u.display_name != u.username %}<div class="small text-muted">{{ u.display_name }}</div>{% endif %}</td>
                                 <td>{% if u.is_admin %}<span class="badge bg-primary">Admin</span>{% else %}<span class="badge bg-secondary">Viewer</span>{% endif %}{% if not u.approved %} <span class="badge text-bg-warning">Pending approval</span>{% endif %}</td>
-                                <td>{% if u.auth_source == 'oidc' %}<span class="badge text-bg-info" title="Role managed by the identity provider">SSO</span>{% if u.email %}<div class="small text-muted">{{ u.email }}</div>{% endif %}{% else %}<span class="badge text-bg-light border">Local</span>{% endif %}</td>
+                                <td>{% if u.auth_source == 'oidc' %}<span class="badge text-bg-info" title="Role managed by the identity provider">SSO</span>{% if u.email %}<div class="small text-muted">{{ u.email }}</div>{% endif %}{% else %}<span class="badge text-bg-light border">Local</span><div class="small {% if u.mfa_enabled %}text-success{% else %}text-muted{% endif %}">{% if u.mfa_enabled %}Second factor enabled{% elif mfa_required %}Enrollment required{% else %}Password only{% endif %}</div>{% endif %}</td>
                                 <td class="small text-muted text-nowrap">{% if u.last_login_at %}{{ u.last_login_at | localtime }}{% else %}never{% endif %}</td>
                                 <td class="text-end text-nowrap">
                                     {% if not u.approved %}

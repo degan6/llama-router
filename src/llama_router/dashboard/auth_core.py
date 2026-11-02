@@ -94,6 +94,7 @@ class SessionToken:
     # tokens minted without one (tests); the dashboard always binds it.
     username: str | None
     issued_at: float
+    mfa_verified: bool = False
 
     def valid_for(self, row: Mapping[str, Any], now: float | None = None) -> bool:
         """Whether this cookie still signs in the account *row*."""
@@ -108,10 +109,19 @@ class SessionToken:
 
 
 def sign_session(
-    user_id: int, secret: str, version: int = 0, username: str | None = None
+    user_id: int,
+    secret: str,
+    version: int = 0,
+    username: str | None = None,
+    *,
+    mfa_verified: bool = False,
 ) -> str:
     ser = URLSafeTimedSerializer(secret, salt="lr-dash-v1")
-    payload: dict[str, Any] = {"u": user_id, "v": version}
+    payload: dict[str, Any] = {
+        "u": user_id,
+        "v": version,
+        "mfa": mfa_verified,
+    }
     if username is not None:
         payload["n"] = username
     return ser.dumps(payload)
@@ -128,6 +138,7 @@ def unsign_session(token: str, secret: str) -> SessionToken | None:
             version=int(d["v"]),
             username=name if isinstance(name, str) else None,
             issued_at=ts.timestamp(),
+            mfa_verified=d.get("mfa") is True,
         )
     except (
         BadSignature,
