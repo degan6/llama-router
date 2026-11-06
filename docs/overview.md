@@ -15,18 +15,27 @@ optionally Sentry and an OpenID Connect provider.
 - `src/llama_router/api/`: Ollama API, decisions API, worker hub socket.
 - `src/llama_router/llamacpp_api/`: OpenAI-compatible API.
 - `src/llama_router/dashboard/`, `templates/`: dashboard, sign-in, OIDC; `GET /healthz`.
+- `src/llama_router/dashboard/routes/`: one `APIRouter` per dashboard tab (`home.py` is `/` and `/api/status`,
+  `login.py`, `users.py`, `providers.py`, `workers.py`, ...); `pages.py` holds the templates and page context,
+  `form_values.py` form parsing, `auth_core.py` passwords, session cookies and safe redirects.
 - `src/llama_router/metrics.py`: Prometheus text format for `GET /metrics`.
 - `src/llama_router/registry_cache/`: pull-through cache for Ollama pulls.
 - `src/llama_router/worker_link/`: hub and worker links.
 - `src/llama_router/router_identity.py`: router ID, loop guard (`X-Llama-Router-Path`).
 - `src/llama_router/provider_manager.py`, `probe.py`: discovery, probing, health.
+  `ProviderManager` combines `provider_health.py` (health loop, probes),
+  `worker_sync.py` (worker links, shared-provider catalogs) and
+  `provider_benchmark.py`; `client_pool.py` holds each provider's clients.
 - `src/llama_router/router.py`, `routing_table.py`, `routing_stats.py`, `affinity.py`: routing.
 - `src/llama_router/model_listing.py`, `dashboard/model_groups.py`: model groups in listings and their API.
+- `src/llama_router/dashboard/mfa.py`, `mfa_store.py`: local WebAuthn, enforced enrollment, recovery.
 - `src/llama_router/dashboard/management_keys.py`: privilege-scoped management keys for the dashboard API.
-- `src/llama_router/dashboard/chat.py`, `templates/chat.html`: Chat tab for trying a model, group or alias on a provider, or on any provider the router picks.
+- `src/llama_router/dashboard/chat.py`, `templates/chat.html`: Chat tab for trying a model, group or alias on a provider, or on any provider the router picks. Chat replies stream from `/api/chat/stream`; images use `/api/chat/send`.
 - `src/llama_router/*_client.py`, `translate.py`: backend clients, Ollama/OpenAI translation.
 - `src/llama_router/decision*.py`: decision models and per-key policies.
 - `src/llama_router/database.py`, `db_*.py`, `alembic/`: storage, migrations (run at startup).
+  `Database` combines the per-domain repositories in `repositories/`;
+  `db_events.py` holds the change reasons its writes announce.
 - `tests/`: pytest; mostly one file per feature.
 - `scripts/decision_spike/`: one-off experiments for decision models.
 - `Dockerfile`: `dev` and `production` stages.
@@ -38,6 +47,8 @@ optionally Sentry and an OpenID Connect provider.
 - All configuration from environment variables; see docs/configuration.md.
 - Async throughout (FastAPI, httpx, SQLAlchemy asyncio).
 - Routing never touches the database on the request path; tables are rebuilt
-  in the background.
+  in the background, in a worker thread. A database change reloads the table
+  (`routing_table.reload`); a live sample that could reorder candidates only
+  rescores it (`routing_table.rescore`).
 - Rules: https://github.com/romkey/python-ai-rules/blob/main/RULES.md;
   deviations in AGENTS.md.

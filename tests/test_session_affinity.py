@@ -12,10 +12,11 @@ from llama_router.affinity import (
     SessionAffinity,
     session_key,
 )
-from llama_router.auth import key_hash, routing_preferences_from_request
+from llama_router.auth import generate_api_key, routing_preferences_from_request
 from llama_router.database import Database
 from llama_router.models import ProviderModel, ProviderProtocol, ProviderStatus
 from llama_router.provider_manager import ProviderManager
+from llama_router.provider_secrets import key_hash
 from llama_router.router import Router, RoutingPreferences
 from llama_router.routing_stats import ProviderStats
 
@@ -340,7 +341,7 @@ def _key_request(key: str) -> Request:
 async def test_api_key_carries_affinity_flag_and_id(db: Database):
     await db.set_allow_unauthenticated(False)
     for flag in (None, True, False):
-        key = f"lrk_affinity-{flag}"
+        key = generate_api_key()
         key_id = await db.create_api_key(
             key[:10], key_hash(key), "balanced", True, flag
         )
@@ -376,6 +377,7 @@ def _json_request(path: str, payload: dict) -> Request:
 
 
 async def test_upstream_failure_forgets_the_session(db, pm, clock, monkeypatch):
+    from llama_router import proxy
     from llama_router.llamacpp_api import chat as chat_api
     from llama_router.llamacpp_api import deps
 
@@ -390,8 +392,8 @@ async def test_upstream_failure_forgets_the_session(db, pm, clock, monkeypatch):
                 "refused", request=httpx.Request("POST", "http://a/v1/chat/completions")
             )
 
-    monkeypatch.setattr(chat_api, "get_v1_client", lambda pm, pid: Down())
-    monkeypatch.setattr(chat_api, "log_request_background", lambda *a, **k: None)
+    monkeypatch.setattr(proxy, "get_v1_client", lambda pm, pid: Down())
+    monkeypatch.setattr(proxy, "log_request_background", lambda *a, **k: None)
 
     body = _chat()
     session = rt.session_for({}, body, None)

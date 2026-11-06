@@ -7,6 +7,280 @@ described in their git tags and GitHub Releases.
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-11-05
+
+### Added
+
+- The dashboard has a favicon, Apple touch icons (including `/apple-touch-icon.png`
+  and `/apple-touch-icon-precomposed.png`), Android icons and a web manifest,
+  served at the site root without a login.
+
+## [0.29.0] - 2026-11-03
+
+### Added
+
+- Worker tokens can expire. Set "Expires after (days)" when creating a worker
+  or when rotating its token (or `expires_in_days` on `POST /api/workers` and
+  `POST /api/workers/{id}/rotate`); the hub refuses an expired token and
+  closes a connected worker's session when its token expires.
+- API keys can have an optional label, set when issuing a key on the API
+  Keys tab or under My API keys (`label` on `POST /api/keys/generate` and
+  `POST /api/my-keys`, up to 100 characters) and shown under the prefix. An
+  upgrade adds the column.
+- Recovery codes have Copy and Download buttons, and generating new ones
+  asks first.
+- Dashboard users with a local account can change their own password from
+  their Account page (`POST /account/password` with the current and new
+  password). It signs the account out everywhere else and keeps this session;
+  wrong guesses count toward the sign-in lockout.
+- Dashboard chat streams replies as the model writes them
+  (`POST /api/chat/stream`, newline-delimited JSON events), with a Stop button
+  that keeps what has arrived so far. Replies render fenced code blocks,
+  inline code, bold and italic.
+
+### Security
+
+- Secrets are derived per purpose with HKDF from `SESSION_SECRET` (or the
+  generated `secret.key`): one key signs session cookies, one encrypts stored
+  provider keys and the worker hub token, one peppers client API key hashes.
+  Client API keys are now stored as HMAC-SHA256 (they are 32 random bytes, so
+  PBKDF2 only cost CPU); existing PBKDF2 and SHA-256 hashes still match and
+  are replaced on first use. Provider keys and the hub token encrypted by
+  earlier releases still decrypt and are re-encrypted with the derived key
+  (provider keys at startup).
+- **`SESSION_SECRET` must now be at least 32 characters**; the router refuses
+  to start with a shorter one. Existing data survives the upgrade when the
+  secret is unchanged. To replace a short secret without re-entering provider
+  keys or reissuing client keys, set the old value as the new
+  `SESSION_SECRET_PREVIOUS` alongside the new `SESSION_SECRET`; data stored
+  under it moves to the new secret. With a configured `SESSION_SECRET`,
+  everyone signed in to the dashboard has to sign in again once after
+  upgrading (cookies are now signed with the derived key). Deployments without
+  `SESSION_SECRET` keep their sessions.
+- Every dashboard response now sends `X-Frame-Options: DENY`, a
+  `Content-Security-Policy` with `frame-ancestors 'none'`, `object-src 'none'`
+  and `base-uri 'self'`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: same-origin` and `Cache-Control: no-store`, plus
+  `Strict-Transport-Security` when the dashboard is served over HTTPS.
+- Non-admin dashboard users get 403 from `/metrics` (a metrics token still
+  works), `/docs`, `/redoc` and `/openapi.json`.
+- A provider's status no longer includes its full URL after a connection
+  error, only the path, so non-admins can't see internal hostnames or
+  credentials in it.
+- Dashboard chat shows non-admins a generic message when the provider fails;
+  admins and the request log keep the upstream detail.
+- The router warns once when a sign-in arrives with `X-Forwarded-For` from a
+  peer not in `LLAMA_ROUTER_TRUSTED_PROXIES`; the README now says the setting
+  is required behind a reverse proxy.
+- `/api/tags`, `/api/version`, `/api/ps`, `/v1/models` and `/v1/models/{name}`
+  now need an API key, like every other API route, unless the authentication
+  policy accepts requests without one. `/health` stays public.
+- A request with an invalid API key no longer costs a PBKDF2 hash every time.
+  Keys not shaped like the router's own (`lrk_` and 43 characters) are refused
+  without hashing, keys the database does not know are remembered and refused
+  for 30 seconds, and at most four hashes run at once.
+- A `Referer` with a port that is not a number no longer makes "run
+  benchmarks" fail with a server error; it redirects to the fallback page.
+- Provider addresses must be plain `http://` or `https://` URLs without
+  credentials in them, when adding a provider and when adding or editing an
+  address. Alibaba Cloud's metadata address (`100.100.100.200`) is refused
+  like the other cloud metadata services.
+- A JSON body nested too deeply to parse gets 400 instead of 500, and the
+  request log's summary of a body stops looking 64 levels down.
+- At most 64 KB of an upstream error body is read, by the API routes and by
+  endpoint probes.
+- Creating a dashboard user or setting a user's password no longer blocks the
+  server while the password is hashed.
+
+### Fixed
+
+- Two routers sharing a database that both start without
+  `LLAMA_ROUTER_SESSION_SECRET` now keep the same generated dashboard session
+  secret, instead of the later one overwriting the earlier one's (which
+  signed out everyone signed in through the other).
+- A management key's "last used" time is recorded on its first use even
+  when the host started less than a minute ago.
+- Two routers (or a router and a `llama-router` command) opening a new
+  SQLite database at the same moment no longer fail with "database is
+  locked" while one of them switches it to WAL.
+- Cancelling a job on a worker whose socket has stalled no longer waits
+  forever; the cancel message is given up on after 5 seconds.
+- Editing a provider or its addresses no longer cuts off requests running on
+  it: they finish on the old connection, which closes once they are done.
+- An upstream that times out now gets 504 and one that cannot be reached 502,
+  each with a JSON `error`, instead of a bare 500. A provider with no address
+  left answers 503 `{"error": "provider has no reachable address"}`.
+- `/v1/audio/transcriptions` and `/v1/images/edits` send the provider its own
+  name for the model (a model group or alias used to be passed on as is) and
+  drop router-only fields such as `provider`, as the JSON routes do.
+
+### Changed
+
+- `provider_manager.py` is split up. `ClientPool` (`client_pool.py`) holds
+  each provider's clients, picks the address they use, adds upstream auth
+  headers, and closes a replaced client once its last request ends. Health
+  checks and endpoint probes move to `provider_health.py`, worker links and
+  their catalogs to `worker_sync.py`, and benchmarks to
+  `provider_benchmark.py`; `ProviderManager` combines them, so callers are
+  unchanged. The new modules pass `mypy --strict`.
+- `database.py` is split into per-domain repositories under
+  `src/llama_router/repositories/` (providers, benchmarks, request log, model
+  config, decisions, chat, workers, API keys, management keys, dashboard
+  users) on a shared query base; the change reasons and `@_notifies` live in
+  `db_events.py`. `Database` still combines them, so callers are unchanged.
+  These modules now pass `mypy --strict`.
+- The ten JSON-body proxy endpoints (`/api/chat`, `/api/generate`,
+  `/api/embeddings`, `/api/embed`, `/v1/chat/completions`, `/v1/completions`,
+  `/v1/embeddings`, `/v1/responses`, `/v1/images/generations`,
+  `/v1/audio/speech`) share one path, `proxy_json` in `proxy.py`, instead of
+  ten copies of routing, slots, logging and upstream-error handling. No
+  change in behavior.
+- `dashboard/routes.py` is split into one router per tab under
+  `dashboard/routes/` (health, login, users, home, routing, API keys,
+  providers, benchmarks, pulls, cache, model aliases, workers). Shared page
+  helpers are in `dashboard/pages.py` and form parsing in
+  `dashboard/form_values.py`; the session cookie and redirect helpers moved
+  to `auth_core.py`. Paths and behaviour are unchanged.
+- Less database and disk work behind the dashboard and the registry cache.
+  `/api/status`, `/api/ps`, `/metrics`, `/health` and `/v1/audio/voices` read
+  every provider's models, addresses and benchmarks in four queries instead
+  of three per provider; `/v1/models` and `/api/tags` list models from the
+  routing table's inputs instead of querying. The registry cache writes and
+  hashes blobs in a worker thread, 4 MB at a time, and the dashboard reads
+  cache statistics off the event loop. Usage per key and the per-model
+  request counts only read request log rows inside
+  `LLAMA_ROUTER_REQUEST_LOG_RETENTION_DAYS`, so "all" means the retained log
+  even before the hourly purge runs. Session affinity finds a key's oldest
+  session without scanning every session, and
+  `LLAMA_ROUTER_SESSION_AFFINITY_MAX_SESSIONS` now defaults to 10000. A
+  streamed response arms one deadline timer instead of one per chunk.
+- More tests at security edges and failure paths: hostile `Referer`
+  headers, WebAuthn sign-count replay, worker sockets that stall, drop or
+  send garbage, a failed routing-table build, a client disconnecting
+  mid-stream (stream counts, provider slots and the upstream are all
+  released), `run()` under several settings, health checks surviving a
+  crashing probe, and Hypothesis round trips of the Ollama/OpenAI
+  translation. Hypothesis is a new dev dependency.
+- Dashboard errors: a page that fails in the browser now shows an error page
+  with a link back instead of raw JSON; `/api/*` still answers in JSON.
+  A failed Add Provider form returns to the dashboard with the message and
+  reopens the dialog with what was typed (except the API key and extra
+  headers); failed provider and address edits return to the provider page
+  with the message. A password sign-in from an address other than
+  `LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN` returns to the sign-in page and
+  names the configured address instead of answering 403.
+- The "Accept requests without an API key" switch now asks for confirmation
+  before turning on, reports success or failure, and turns itself back if
+  the change fails. While it is on, the dashboard header shows an "Open
+  access" badge. The switch and the limits for keys users issue themselves
+  share a new Security card under API Keys.
+- The dashboard stops refreshing provider status while its tab is hidden,
+  and when the session has expired it shows a "sign in again" banner and
+  stops instead of polling forever.
+- Dashboard JSON endpoints share one body parser: a body that is not a JSON
+  object, or a `provider_id` that is not a number in `/api/benchmark` and
+  `/api/pull`, now gets 400 instead of 500.
+- The request log is written by one background writer in batches (up to 200
+  rows or every 100 ms) instead of a task and a transaction per request. Its
+  queue holds 10,000 rows; when the database falls further behind, rows are
+  dropped and counted in the new `request_log_dropped_total` metric.
+  Shutdown writes what is queued before closing the database.
+- SQLite databases use WAL journaling with `synchronous=NORMAL` and a
+  five-second busy timeout, so dashboard reads no longer wait on log writes,
+  and skip the per-checkout connection ping.
+- An upgrade adds an index on the request log's model and time.
+- The dashboard's request log page count is cached for 30 seconds instead of
+  counting the whole log on every refresh.
+- A request's logged size is the body the client sent, not the parsed body
+  serialised again.
+- Dashboard accessibility and structure. Status is never shown by colour
+  alone: each provider state and address liveness has its own icon and
+  text, and an offline provider always says why. Icon-only buttons and
+  close buttons have labels; each page has one `h1`, cards use `h2`. Chat
+  conversations are buttons and their delete button shows on keyboard
+  focus; a log row's error detail opens from a button that reports whether
+  it is open. Confirmations name what they remove.
+- Dashboard layout: the provider counts sit in the Providers tab; the API
+  Keys tab is split into Keys and a new Routing tab (preview, table,
+  explorer); the menu groups Operate tabs, then Access (API Keys, Routing,
+  Users) and Tools (Decisions, Chat) menus so it fits one row; the Log count
+  shows on every page. Users' actions are in a menu per row, the last
+  sign-in is relative and the sign-in detail is a tooltip. The Add Provider
+  dialog scrolls and keeps room for the probe result.
+- Dates on the dashboard all read `YYYY-MM-DD HH:MM` in the browser's time
+  zone, with the full time on hover.
+- "Profile" is now "Account"; the Workers card "Serve a hub from this
+  router" is now "Connect to a hub (run as a worker)".
+- Test infrastructure: CI runs the whole suite against PostgreSQL and MySQL
+  as well as SQLite, checks there is a single Alembic head, and runs the
+  tests in parallel. Coverage now includes the Alembic migrations (floor
+  raised to 85%), new tests downgrade every migration and upgrade again, and
+  check that `llama-router-migrate-sqlite-pg` copies every table and column.
+  Tests start from a copy of one migrated database instead of migrating each
+  time, and the timer tests use a fake clock instead of waiting. The
+  `009_single_protocol_providers` and `010_provider_flavor` migration files
+  are renamed `010a_` and `010b_` so they sort in the order they run; their
+  revision ids are unchanged.
+
+### Fixed
+
+- On PostgreSQL, request log retention no longer fails with "can't subtract
+  offset-naive and offset-aware datetimes", so old request logs are deleted.
+- The "accept requests without an API key" setting is re-read every five
+  minutes, so routers sharing a database see a change made on another one.
+- A management key used in the router's first minute after boot now records
+  its last-used time.
+- If one of the router's servers cannot bind its port, the others are stopped
+  and the router exits with an error instead of running without it.
+- Benchmarks of Ollama-style providers that leave out `eval_duration`, such as
+  another llama-router in front of llama.cpp, no longer report billions of
+  tokens per second. The benchmark falls back to the reported or measured
+  time, the router's Ollama translation now reports `eval_duration` and
+  `prompt_eval_duration` (from llama-server's timings when present), speeds
+  over a million tokens per second are not stored, and an upgrade deletes the
+  bad benchmarks already stored so they are measured again.
+- A hub client that falls more than `LLAMA_ROUTER_WORKER_RESPONSE_BUFFER_BYTES`
+  behind a worker's response no longer stalls every other job on that worker:
+  the hub fails and cancels only that job instead of pausing the socket.
+- Workers decode the request path before checking it against the allowed
+  endpoints, and refuse encoded slashes (`%2F`), `.` and `..` segments and
+  doubly encoded paths, so an encoded path cannot reach an endpoint the
+  worker does not serve.
+- The routing table no longer stalls request handling while it is rebuilt,
+  and is rebuilt far less often. Building runs in a worker thread; a live
+  request or health-check sample only rescores the existing candidates
+  instead of re-reading the database, and only when it could change an
+  ordering (a moving average moved over 10 %, a failure rate moved, or a
+  circuit or warm flag flipped). Per-locality and hub rankings are built on
+  first use. A provider flipping between busy and idle no longer reloads the
+  table every health-check cycle.
+
+## [0.28.0] - 2026-11-02
+
+### Added
+
+- Password + WebAuthn second factor for local dashboard accounts, with multiple
+  named authenticators, single-use recovery codes and an operator recovery
+  command. `LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR` enforces enrollment
+  and second-factor login for all local users, including admins, and rejects
+  existing password-only sessions. Configure a stable HTTPS origin with
+  `LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN`; SSO and API-key authentication stay
+  unchanged.
+- Non-admin dashboard users can view request logs and counts for their own
+  current API keys. Backend error details remain admin-only.
+
+### Changed
+
+- Open the profile page from the dashboard username. Authenticator management,
+  registration and recovery codes use separate cards.
+- Move Decisions from the top banner to the shared dashboard navigation,
+  immediately after Models.
+
+### Fixed
+
+- SQLite no longer reuses deleted API-key IDs, preventing new keys from
+  inheriting access to retained request logs for deleted keys.
+
 ## [0.27.0] - 2026-11-01
 
 ### Security

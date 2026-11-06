@@ -16,6 +16,7 @@ from llama_router.models import (
 )
 from llama_router.provider_manager import ProviderManager
 from llama_router.routing_table import latest_benchmarks
+from tests.conftest import asgi_client
 
 
 async def _provider(db: Database, name: str, models: list[str], **kw):
@@ -210,14 +211,14 @@ async def test_warm_runs_do_not_record_startup(db: Database, pm: ProviderManager
     p = await _provider(db, "a", ["m"])
     # The backend's own load time decides, whatever the router thinks is
     # loaded: here the router believes nothing is.
-    pm._ollama_clients[p.id] = _FakeOllama(startup_ms=2.0)
+    pm.clients.ollama[p.id] = _FakeOllama(startup_ms=2.0)
     warm = await pm.benchmark_provider(p.id, "m", source="auto")
     assert warm.startup_time_ms is None
     assert warm.source == "auto"
 
     # ...and a real load is recorded even if the router thinks it is loaded.
     pm._set_hot_models(p.id, [{"name": "m"}])
-    pm._ollama_clients[p.id] = _FakeOllama(startup_ms=4200.0)
+    pm.clients.ollama[p.id] = _FakeOllama(startup_ms=4200.0)
     cold = await pm.benchmark_provider(p.id, "m")
     assert cold.startup_time_ms == 4200.0
     assert cold.source == "manual"
@@ -246,7 +247,7 @@ async def test_llamacpp_loaded_model_is_hot(db: Database, pm: ProviderManager):
     p = await _provider(db, "lcpp", ["m", "n"], ptype=ProviderProtocol.OPENAI)
     provider = await db.get_provider(p.id)
     lcpp = _FakeLlamaCpp("m")
-    pm._llamacpp_clients[p.id] = lcpp
+    pm.clients.llamacpp[p.id] = lcpp
     await pm._refresh_hot_models(provider)
     rt = Router(db, pm)
 
@@ -350,27 +351,27 @@ def test_llamacpp_metrics_use_server_timings():
 
 
 async def test_auto_benchmark_api(db: Database, pm: ProviderManager):
-    from fastapi.testclient import TestClient
-
     from llama_router.dashboard import deps as dash_deps
     from llama_router.dashboard.app import app as dash_app
 
     await _provider(db, "a", ["m"])
     dash_deps.init(db, pm)
     dash_deps.init_auto_benchmark(AutoBenchmarker(db, pm))
-    with TestClient(dash_app) as client:
-        status = client.get("/api/auto-benchmark").json()
+    async with asgi_client(dash_app) as client:
+        status = (await client.get("/api/auto-benchmark")).json()
         assert status["config"]["enabled"] is True
         assert status["pending"] == 1
         assert status["next"][0]["model"] == "m"
-        saved = client.post(
-            "/api/auto-benchmark",
-            json={"enabled": False, "idle_minutes": 10, "max_age_days": 2},
+        saved = (
+            await client.post(
+                "/api/auto-benchmark",
+                json={"enabled": False, "idle_minutes": 10, "max_age_days": 2},
+            )
         ).json()
         assert saved == {"enabled": False, "idle_seconds": 600, "max_age_days": 2.0}
-        bad = client.post("/api/auto-benchmark", json={"idle_minutes": 0.1})
+        bad = await client.post("/api/auto-benchmark", json={"idle_minutes": 0.1})
         assert bad.status_code == 400
-        page = client.get("/").text
+        page = (await client.get("/")).text
         assert "Auto-benchmark" in page
         assert 'id="ab-status"' in page
     dash_deps.init_auto_benchmark(None)

@@ -6,23 +6,31 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import pytest
+from starlette.requests import Request
 
 from llama_router import hf_download
+from llama_router import provider_secrets as ps
 from llama_router.config import settings
+from llama_router.dashboard import chat as chat_mod
 from llama_router.dashboard import deps as dash_deps
 from llama_router.dashboard.auth_core import AUTH_COOKIE, hash_password, sign_session
 from llama_router.dashboard.middleware import invalidate_dashboard_user_count_cache
-from llama_router.dashboard.routes import REDACTED_ADDRESS
+from llama_router.dashboard.routes import login as dash_login
+from llama_router.dashboard.routes.home import REDACTED_ADDRESS
 from llama_router.database import Database
 from llama_router.llamacpp_client import OpenAIClient
 from llama_router.models import ProviderModel, ProviderProtocol, ProviderStatus
 from llama_router.probe import BlockedAddressError, check_not_metadata, is_metadata_ip
+from llama_router.provider_health import _failure_reason
+from llama_router.provider_secrets import session_signing_key
 from llama_router.router import Router
 
 DashClient = tuple[httpx.AsyncClient, Database]
@@ -30,7 +38,7 @@ TEMPLATES = Path(__file__).parent.parent / "src" / "llama_router" / "templates"
 
 
 def _as(user_id: int) -> dict[str, str]:
-    token = sign_session(user_id, settings.session_secret.strip())
+    token = sign_session(user_id, session_signing_key())
     return {"Cookie": f"{AUTH_COOKIE}={token}"}
 
 
@@ -55,7 +63,7 @@ async def _provider(db: Database, name: str, locality: str) -> int:
             200, json={"choices": [{"message": {"role": "assistant", "content": name}}]}
         )
 
-    dash_deps.get_pm()._llamacpp_clients[pid] = OpenAIClient(
+    dash_deps.get_pm().clients.llamacpp[pid] = OpenAIClient(
         f"http://{name}:8000", transport=httpx.MockTransport(handler)
     )
     return pid
@@ -72,7 +80,7 @@ def test_dashboard_template_escapes_interpolated_data() -> None:
         "esc(a.url)",
         "esc(md.name)",
         "esc(b.label)",
-        "esc(p.status)",
+        "esc(status)",
         "esc(model)",
         "esc(err.message || 'Failed')",
     ):
@@ -261,6 +269,8 @@ def test_mask_userinfo(raw: str, masked: str) -> None:
         ("169.254.0.1", True),
         ("fd00:ec2::254", True),
         ("::ffff:169.254.169.254", True),
+        ("100.100.100.200", True),
+        ("100.100.100.201", False),
         ("127.0.0.1", False),
         ("10.0.0.5", False),
         ("192.168.1.10", False),
@@ -306,8 +316,8 @@ async def test_provider_routes_refuse_metadata_addresses(
     resp = await c.post(
         "/providers/add", data={"name": "m", "url": meta, "protocol": "ollama"}
     )
-    assert resp.status_code == 400
-    assert "metadata" in resp.json()["detail"]
+    assert resp.status_code == 303
+    assert "metadata" in unquote(resp.headers["location"])
     assert await db.list_providers() == []
 
     resp = await c.post(
@@ -318,14 +328,14 @@ async def test_provider_routes_refuse_metadata_addresses(
     [p] = await db.list_providers()
     pid = p.require_id()
     resp = await c.post(f"/providers/{pid}/addresses/add", data={"url": meta})
-    assert resp.status_code == 400
+    assert "metadata" in unquote(resp.headers["location"])
     resp = await c.post(f"/providers/{pid}/addresses/save", data={"url": meta})
-    assert resp.status_code == 400
+    assert "metadata" in unquote(resp.headers["location"])
     [addr] = await db.get_addresses(pid)
     resp = await c.post(
         f"/providers/{pid}/addresses/{addr.id}/edit", data={"url": meta}
     )
-    assert resp.status_code == 400
+    assert resp.headers["location"].startswith(f"/providers/{pid}?error=")
     assert [a.url for a in await db.get_addresses(pid)] == ["http://127.0.0.1:9"]
 
 
@@ -349,3 +359,240 @@ async def test_status_hides_addresses_from_non_admins(dash_client: DashClient) -
     assert [a["url"] for a in full["providers"][0]["addresses"]] == [
         "http://10.1.2.3:11434"
     ]
+
+
+# --- Referer redirects and the generated session secret ---
+
+
+def _referer_request(referer: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/benchmarks/run",
+            "root_path": "",
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "headers": [(b"host", b"testserver"), (b"referer", referer.encode())],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("referer", "expected"),
+    [
+        ("https://evil/", "/fallback"),
+        ("http://evil/x", "/fallback"),
+        ("//evil/x", "/fallback"),
+        ("javascript:alert(1)", "/fallback"),
+        ("javascript://testserver/%0aalert(1)", "/fallback"),
+        ("http://testserver:8080/x", "/fallback"),
+        ("https://testserver/x", "/fallback"),
+        ("http://testserver:abc/x", "/fallback"),
+        ("http://[::1/x", "/fallback"),
+        ("http://testserver//evil/x", "/fallback"),
+        ("", "/fallback"),
+        ("http://testserver/x?tab=a&b=1", "/x?tab=a&b=1"),
+        ("http://TESTSERVER:80/x", "/x"),
+        ("http://testserver", "/"),
+    ],
+)
+def test_referer_redirect_stays_on_this_origin(referer: str, expected: str) -> None:
+    from llama_router.dashboard.pages import _same_origin_referer_path
+
+    assert _same_origin_referer_path(_referer_request(referer), "/fallback") == expected
+
+
+async def test_session_secret_is_generated_once_and_kept(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "session_secret", "")
+    dash_deps.init(db, None)  # type: ignore[arg-type]
+    dash_deps.invalidate_dashboard_session_secret_cache()
+    try:
+        secret = await dash_deps.get_dashboard_session_secret()
+        assert len(secret) >= 32
+        assert await db.get_app_setting("dashboard_session_secret") == secret
+        # Cached: no database work for the next request.
+        monkeypatch.setattr(db, "get_app_setting", None)
+        assert await dash_deps.get_dashboard_session_secret() == secret
+        monkeypatch.undo()
+        # A restart reads it back instead of making a new one.
+        monkeypatch.setattr(settings, "session_secret", "")
+        dash_deps.invalidate_dashboard_session_secret_cache()
+        assert await dash_deps.get_dashboard_session_secret() == secret
+        # A configured secret wins, through its HKDF "session" key.
+        monkeypatch.setattr(settings, "session_secret", "  configured-secret  ")
+        assert await dash_deps.get_dashboard_session_secret() == (
+            ps.derive_key("session", b"configured-secret").hex()
+        )
+    finally:
+        dash_deps.invalidate_dashboard_session_secret_cache()
+        dash_deps._db = None
+
+
+async def test_two_routers_generating_the_session_secret_agree(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both routers read "no secret yet" before either stores one."""
+    monkeypatch.setattr(settings, "session_secret", "")
+    first, second = Database(database_url), Database(database_url)
+    await first.connect()
+    await second.connect()
+    both_read = asyncio.Barrier(2)
+
+    def racing(database: Database) -> None:
+        real = database.get_app_setting
+        raced = False
+
+        async def get(key: str) -> str | None:
+            nonlocal raced
+            value = await real(key)
+            if not raced:
+                raced = True
+                await both_read.wait()
+            return value
+
+        monkeypatch.setattr(database, "get_app_setting", get)
+
+    racing(first)
+    racing(second)
+
+    async def secret_of(database: Database) -> str:
+        # Each router process has its own module state; switch it in.
+        dash_deps.init(database, None)  # type: ignore[arg-type]
+        dash_deps.invalidate_dashboard_session_secret_cache()
+        return await dash_deps.get_dashboard_session_secret()
+
+    try:
+        a, b = await asyncio.gather(secret_of(first), secret_of(second))
+        assert a == b
+        assert await first.get_app_setting("dashboard_session_secret") == a
+    finally:
+        dash_deps.invalidate_dashboard_session_secret_cache()
+        dash_deps._db = None
+        await first.close()
+        await second.close()
+
+
+async def test_status_detail_never_carries_the_provider_url(
+    dash_client: DashClient,
+) -> None:
+    c, db = dash_client
+    _admin, ann = await _users(db)
+    p = await db.add_provider("gpu", ProviderProtocol.OLLAMA)
+    pid = p.require_id()
+    await db.add_address(pid, "http://secret-host.lan:11434", True)
+    req = httpx.Request("GET", "http://user:pw@secret-host.lan:11434/api/tags")
+    detail = _failure_reason(httpx.ConnectError("Connection refused", request=req))
+    assert detail == "ConnectError for /api/tags: Connection refused"
+    tls = httpx.ConnectError(
+        "hostname 'secret-host.lan' doesn't match certificate", request=req
+    )
+    assert "secret-host" not in _failure_reason(tls)
+    assert _failure_reason(httpx.ConnectError("secret-host.lan")) == "ConnectError"
+    dash_deps.get_pm()._status_detail[pid] = detail
+
+    seen = json.dumps((await c.get("/api/status", headers=_as(ann))).json())
+    assert "/api/tags" in seen
+    assert "http" not in seen
+    assert "secret-host" not in seen
+
+
+# --- Security headers ---
+
+
+async def test_security_headers_on_every_response(
+    dash_client: DashClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, db = dash_client
+    _admin, ann = await _users(db)
+    for resp in (
+        await c.get("/login"),
+        await c.get("/"),  # redirect to /login from the auth middleware
+        await c.get("/api/status", headers=_as(ann)),
+        await c.get("/api/keys", headers=_as(ann)),  # 403
+    ):
+        h = resp.headers
+        assert h["x-frame-options"] == "DENY"
+        assert h["content-security-policy"] == (
+            "frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
+        )
+        assert h["x-content-type-options"] == "nosniff"
+        assert h["referrer-policy"] == "same-origin"
+        assert h["cache-control"] == "no-store"
+        assert "strict-transport-security" not in h
+
+    monkeypatch.setattr(settings, "dashboard_cookie_secure", True)
+    resp = await c.get("/login")
+    assert resp.headers["strict-transport-security"] == "max-age=31536000"
+    monkeypatch.setattr(settings, "dashboard_cookie_secure", False)
+    resp = await c.get("/login", headers={"X-Forwarded-Proto": "https"})
+    assert resp.headers["strict-transport-security"] == "max-age=31536000"
+
+
+# --- Admin-only machine pages ---
+
+
+@pytest.mark.parametrize("path", ["/metrics", "/docs", "/redoc", "/openapi.json"])
+async def test_viewer_cannot_read_metrics_or_api_docs(
+    dash_client: DashClient, path: str
+) -> None:
+    c, db = dash_client
+    admin, ann = await _users(db)
+    assert (await c.get(path, headers=_as(ann))).status_code == 403
+    assert (await c.get(path, headers=_as(admin))).status_code == 200
+
+
+# --- Chat errors ---
+
+
+async def test_chat_error_detail_is_admin_only(dash_client: DashClient) -> None:
+    c, db = dash_client
+    admin, ann = await _users(db)
+    p = await db.add_provider("gpu", ProviderProtocol.OPENAI)
+    pid = p.require_id()
+    await db.update_provider_settings(pid, locality="local")
+    await db.update_provider_status(pid, ProviderStatus.IDLE)
+    await db.set_provider_models(pid, [ProviderModel(provider_id=pid, name="chatty")])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    dash_deps.get_pm().clients.llamacpp[pid] = OpenAIClient(
+        "http://secret-host.lan:8000", transport=httpx.MockTransport(handler)
+    )
+    body = {"provider_id": pid, "model": "chatty", "content": "hi"}
+
+    resp = await c.post("/api/chat/send", json=body, headers=_as(ann))
+    reply = resp.json()["messages"][1]
+    assert reply["role"] == "error"
+    assert reply["content"] == chat_mod._GENERIC_ERROR
+
+    resp = await c.post("/api/chat/send", json=body, headers=_as(admin))
+    reply = resp.json()["messages"][1]
+    assert "secret-host.lan" in reply["content"]
+
+
+# --- Untrusted X-Forwarded-For ---
+
+
+async def test_untrusted_forwarded_for_warns_once(
+    dash_client: DashClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    c, db = dash_client
+    await _users(db)
+    monkeypatch.setattr(settings, "trusted_proxies", "")
+    monkeypatch.setattr(dash_login, "_warned_untrusted_forwarded_for", False)
+    form = {"username": "ann", "password": "wrong-password"}
+    with caplog.at_level(logging.WARNING, logger=dash_login.logger.name):
+        await c.post("/login", data=form)
+        assert "X-Forwarded-For" not in caplog.text
+        for _ in range(2):
+            await c.post(
+                "/login", data=form, headers={"X-Forwarded-For": "198.51.100.7"}
+            )
+    assert caplog.text.count("LLAMA_ROUTER_TRUSTED_PROXIES") == 1

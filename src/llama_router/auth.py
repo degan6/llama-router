@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
+import re
 import time
 import weakref
+from collections.abc import Callable
 from dataclasses import replace
 from secrets import token_urlsafe
 from typing import Any
@@ -16,7 +17,13 @@ from .config import settings
 from .database import AUTH_CHANGES, CHANGE_PROVIDERS, Database
 from .decision_policy import DecisionPolicy, parse_policy
 from .pricing import estimate_tokens
-from .provider_secrets import server_secret
+from .provider_secrets import (
+    key_hash,
+    key_hash_legacy,
+    key_hash_pbkdf2,
+    key_hash_previous,
+    pbkdf2_peppers,
+)
 from .router import ROUTING_MODES, Router, RouteResult, RoutingPreferences
 from .routing_table import DEFAULT_MODE
 from .spend import RESERVATION_STATE, cap_reached, tracker_for
@@ -26,16 +33,31 @@ from .worker_link.relay import is_own_relay
 
 logger = logging.getLogger(__name__)
 
-_PBKDF2_ROUNDS = 390_000
 # Resolved keys are reused for this long unless an edit invalidates them.
 _PREFS_TTL_S = 300.0
 # last_used_at is written at most this often per key.
 _TOUCH_INTERVAL_S = 60.0
 _MAX_CACHED_KEYS = 1024
+# Keys the database did not know are refused from memory for this long, so
+# a client retrying a wrong key does not cost a PBKDF2 hash per request
+# (older fingerprints are still checked for keys the fast forms miss).
+_INVALID_TTL_S = 30.0
+_MAX_INVALID_KEYS = 10_000
+# At most this many PBKDF2 hashes run at once (per event loop).
+_MAX_CONCURRENT_HASHES = 4
+
+# What generate_api_key returns: "lrk_" and 32 random bytes in URL-safe
+# base64. Anything else cannot be a key, so it is refused without hashing.
+_KEY_FORMAT = re.compile(r"lrk_[A-Za-z0-9_-]{43}")
 
 
 def generate_api_key() -> str:
     return "lrk_" + token_urlsafe(32)
+
+
+def well_formed_key(key: str) -> bool:
+    """Whether *key* has the shape of a key :func:`generate_api_key` makes."""
+    return _KEY_FORMAT.fullmatch(key) is not None
 
 
 def key_prefix(key: str) -> str:
@@ -44,50 +66,22 @@ def key_prefix(key: str) -> str:
     return key[:10] + "…"
 
 
-def key_hash_legacy(key: str) -> str:
-    """Legacy storage format (plain SHA-256); used for backward-compatible lookup."""
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-
-# The fixed pepper older releases used without a session secret. Keys
-# hashed with it still match and are re-hashed with the current pepper.
-_LEGACY_DEV_PEPPER = b"llama-router-api-key-pepper-dev"
-
-
-def _pbkdf2(key: str, pepper: bytes) -> str:
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        key.encode("utf-8"),
-        pepper,
-        _PBKDF2_ROUNDS,
-    ).hex()
-
-
-def key_hash(key: str) -> str:
-    """Fingerprint for API key storage using PBKDF2-HMAC-SHA256.
-
-    The pepper is ``LLAMA_ROUTER_SESSION_SECRET``, or the generated secret
-    file's value when that is not set.
-    """
-    return _pbkdf2(key, server_secret())
-
-
-def key_hash_legacy_pepper(key: str) -> str:
-    """PBKDF2 fingerprint with the old fixed development pepper."""
-    return _pbkdf2(key, _LEGACY_DEV_PEPPER)
-
-
 class _AuthCache:
     """Resolved API keys and the unauthenticated-access flag for one database.
 
     Keys are cached by their SHA-256, never in plain text. Entries expire after
-    a few minutes and are dropped at once when keys, pins, providers or the
-    auth setting change, so dashboard edits apply to the next request.
+    a few minutes (unknown keys and the auth setting sooner) and are dropped at
+    once when keys, pins, providers or the auth setting change here, so
+    dashboard edits apply to the next request. Other replicas sharing the
+    database pick them up when their entries expire.
     """
 
     def __init__(self, db: Database) -> None:
-        self.allow_unauthenticated: bool | None = None
+        # (fetched at, value)
+        self.allow_unauthenticated: tuple[float, bool] | None = None
         self.prefs: dict[str, tuple[float, int, RoutingPreferences]] = {}
+        # SHA-256 of keys the database did not know -> when that expires.
+        self.invalid: dict[str, float] = {}
         self.touched: dict[int, float] = {}
         # Bumped on every clear. A lookup that started before a clear must
         # not store its (possibly stale) answer afterwards.
@@ -102,6 +96,23 @@ class _AuthCache:
         self.generation += 1
         self.allow_unauthenticated = None
         self.prefs.clear()
+        self.invalid.clear()
+
+    def is_invalid(self, fingerprint: str, now: float) -> bool:
+        expires = self.invalid.get(fingerprint)
+        if expires is None:
+            return False
+        if now < expires:
+            return True
+        del self.invalid[fingerprint]
+        return False
+
+    def remember_invalid(self, fingerprint: str, now: float) -> None:
+        if len(self.invalid) >= _MAX_INVALID_KEYS:
+            self.invalid = {k: t for k, t in self.invalid.items() if t > now}
+            if len(self.invalid) >= _MAX_INVALID_KEYS:
+                self.invalid.clear()
+        self.invalid[fingerprint] = now + _INVALID_TTL_S
 
 
 _caches: weakref.WeakKeyDictionary[Database, _AuthCache] = weakref.WeakKeyDictionary()
@@ -122,13 +133,73 @@ def invalidate_auth_cache(db: Database) -> None:
 
 async def _allow_unauthenticated(db: Database, cache: _AuthCache) -> bool:
     cached = cache.allow_unauthenticated
-    if cached is not None:
-        return cached
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _PREFS_TTL_S:
+        return cached[1]
     generation = cache.generation
     value = await db.get_allow_unauthenticated()
     if cache.generation == generation:
-        cache.allow_unauthenticated = value
+        cache.allow_unauthenticated = (now, value)
     return value
+
+
+_hash_slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def _hash_off_loop(
+    fn: Callable[[str, bytes], str], key: str, pepper: bytes
+) -> str:
+    """Run a PBKDF2 hash in a thread, a few at a time.
+
+    PBKDF2 takes tens of milliseconds; a flood of keys must not tie up every
+    worker thread the event loop has.
+    """
+    loop = asyncio.get_running_loop()
+    slots = _hash_slots.get(loop)
+    if slots is None:
+        slots = _hash_slots[loop] = asyncio.Semaphore(_MAX_CONCURRENT_HASHES)
+    async with slots:
+        return await asyncio.to_thread(fn, key, pepper)
+
+
+async def _upgrade_hash(db: Database, key_id: int, modern: str) -> None:
+    try:
+        await db.set_api_key_hash(key_id, modern)
+        logger.info("Upgraded API key %s to an HMAC-SHA256 hash", key_id)
+    except Exception:
+        logger.warning(
+            "Could not upgrade the hash of API key %s", key_id, exc_info=True
+        )
+
+
+async def _lookup_record(db: Database, key: str, legacy: str) -> dict[str, Any] | None:
+    """The key's database row, upgrading an older fingerprint to HMAC-SHA256.
+
+    Tries the current fingerprint, then plain SHA-256 (*legacy*) and the HMAC
+    under the previous secret, which are cheap, and only then PBKDF2 under
+    each secret older releases may have used.
+    """
+    modern = key_hash(key)
+    record = await db.lookup_api_key(modern)
+    if record:
+        return record
+    for old in (legacy, key_hash_previous(key)):
+        if old is None or old == modern:
+            continue
+        record = await db.lookup_api_key(old)
+        if record:
+            await _upgrade_hash(db, int(record["id"]), modern)
+            return record
+    for pepper in pbkdf2_peppers():
+        old = await _hash_off_loop(key_hash_pbkdf2, key, pepper)
+        record = await db.lookup_api_key(old)
+        if record:
+            await _upgrade_hash(db, int(record["id"]), modern)
+            return record
+    # A concurrent request may have just re-hashed it.
+    return await db.lookup_api_key(modern)
 
 
 async def _resolve_key(
@@ -138,34 +209,7 @@ async def _resolve_key(
 
     *legacy* is ``key_hash_legacy(key)``, already computed by the caller.
     """
-    record = await db.lookup_api_key(legacy)
-    # PBKDF2 takes tens of milliseconds; keep it off the event loop.
-    modern = await asyncio.to_thread(key_hash, key)
-    if record:
-        # Stored in the old plain SHA-256 form: upgrade it now that we have
-        # the key. Lookups still try the legacy form first, then PBKDF2.
-        if modern != legacy:
-            try:
-                await db.set_api_key_hash(int(record["id"]), modern)
-                logger.info("Upgraded API key %s to a PBKDF2 hash", record["id"])
-            except Exception:
-                logger.warning(
-                    "Could not upgrade the hash of API key %s",
-                    record["id"],
-                    exc_info=True,
-                )
-    else:
-        if modern != legacy:
-            record = await db.lookup_api_key(modern)
-        if not record and not settings.session_secret.strip():
-            # Created before the generated secret replaced the fixed pepper.
-            old = await asyncio.to_thread(key_hash_legacy_pepper, key)
-            record = await db.lookup_api_key(old)
-            if record:
-                await db.set_api_key_hash(int(record["id"]), modern)
-            else:
-                # A concurrent request may have just re-hashed it.
-                record = await db.lookup_api_key(modern)
+    record = await _lookup_record(db, key, legacy)
     if not record:
         return None
     mode = str(record["routing_mode"]).lower()
@@ -374,10 +418,15 @@ async def _key_preferences(db: Database, request: Request) -> RoutingPreferences
             detail="Missing API key: send API-KEY or Authorization: Bearer",
         )
 
+    if not well_formed_key(key):
+        raise HTTPException(status_code=401, detail="Invalid API-KEY")
+
     # The legacy digest is needed for the lookup anyway; it doubles as the
     # in-memory cache key so the plain key is never kept.
     fingerprint = key_hash_legacy(key)
     now = time.monotonic()
+    if cache.is_invalid(fingerprint, now):
+        raise HTTPException(status_code=401, detail="Invalid API-KEY")
     hit = cache.prefs.get(fingerprint)
     if hit is not None and now - hit[0] < _PREFS_TTL_S:
         _, key_id, prefs = hit
@@ -389,6 +438,8 @@ async def _key_preferences(db: Database, request: Request) -> RoutingPreferences
     generation = cache.generation
     resolved = await _resolve_key(db, key, fingerprint)
     if resolved is None:
+        if cache.generation == generation:
+            cache.remember_invalid(fingerprint, now)
         # Even with anonymous access on: a client that sends a wrong or
         # revoked key should find out rather than silently lose its limits.
         raise HTTPException(status_code=401, detail="Invalid API-KEY")

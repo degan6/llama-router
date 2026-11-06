@@ -26,6 +26,7 @@ from .auth_core import (
     non_admin_forbidden_get_path,
     unsign_session,
 )
+from .site_icons import ICON_PATHS
 
 logger = logging.getLogger(__name__)
 
@@ -188,9 +189,9 @@ async def setup_required_response(request: Request) -> Response:
     """The only answer while there are no accounts."""
     if request.url.path.startswith("/api/"):
         return JSONResponse(status_code=503, content={"detail": SETUP_REQUIRED_DETAIL})
-    # Imported here: routes imports this module.
+    # Imported here: the users routes import this module.
     from . import oidc
-    from .routes import templates
+    from .pages import templates
 
     cfg = oidc.current_config()
     return templates.TemplateResponse(
@@ -207,8 +208,13 @@ async def setup_required_response(request: Request) -> Response:
     )
 
 
+# Machine-readable pages refused with a plain 403 rather than a redirect.
+_FORBIDDEN_AS_403 = ("/metrics", "/docs", "/redoc", "/openapi.json")
+
+
 def _forbidden(request: Request) -> Response:
-    if request.url.path.startswith("/api/"):
+    path = request.url.path
+    if path.startswith("/api/") or path.startswith(_FORBIDDEN_AS_403):
         return JSONResponse(status_code=403, content={"detail": "Forbidden"})
     return RedirectResponse(url="/?error=forbidden", status_code=302)
 
@@ -228,7 +234,7 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         path = request.url.path
 
-        if path in ("/health", "/healthz"):
+        if path in ("/health", "/healthz") or path in ICON_PATHS:
             return await call_next(request)
 
         if path == "/metrics" and _metrics_token_ok(request):
@@ -269,14 +275,17 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
         user: DashboardUser | None = None
         if session is not None:
             row = await db.get_dashboard_user_by_id(session.user_id)
-            # Revoked (session_version bumped), expired, or awaiting approval.
             if row and session.valid_for(row):
-                user = DashboardUser(
-                    id=row["id"],
-                    username=row["username"],
-                    is_admin=row["is_admin"],
-                    auth_source=row.get("auth_source") or "local",
+                requires_mfa = row.get("auth_source", "local") == "local" and (
+                    row["mfa_enabled"] or settings.dashboard_require_second_factor
                 )
+                if not requires_mfa or session.mfa_verified:
+                    user = DashboardUser(
+                        id=row["id"],
+                        username=row["username"],
+                        is_admin=row["is_admin"],
+                        auth_source=row.get("auth_source") or "local",
+                    )
 
         if user is None:
             if path.startswith("/api/"):
@@ -296,6 +305,13 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
         request.state.dashboard_user = user
 
         if user and request.method == "POST" and path in _LOGOUT_PATHS:
+            return await call_next(request)
+
+        if path in (
+            "/profile",
+            "/account/security",
+            "/account/password",
+        ) or path.startswith("/account/security/"):
             return await call_next(request)
 
         if not user.is_admin:

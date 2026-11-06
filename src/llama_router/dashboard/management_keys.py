@@ -13,7 +13,6 @@ slow hash protects guessable passwords, not tokens like these.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -26,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 from ..auth import key_prefix
 from ..database import Database
+from ..provider_secrets import management_key_hash
 from . import deps
 
 logger = logging.getLogger(__name__)
@@ -77,10 +77,6 @@ class ManagementKey:
 
 def generate_management_key() -> str:
     return KEY_PREFIX + token_urlsafe(32)
-
-
-def management_key_hash(key: str) -> str:
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 def bearer_token(request: Request) -> str | None:
@@ -148,7 +144,8 @@ async def authenticate(db: Database, token: str) -> ManagementKey | None:
         return None
     key_id = int(row["id"])
     now = time.monotonic()
-    if now - _touched.get(key_id, 0.0) >= _TOUCH_INTERVAL_S:
+    last = _touched.get(key_id)
+    if last is None or now - last >= _TOUCH_INTERVAL_S:
         _touched[key_id] = now
         await db.touch_management_key(key_id)
     return ManagementKey(
@@ -191,12 +188,7 @@ async def api_create_management_key(request: Request) -> JSONResponse:
     The key is in the response once and never again.
     """
     admin = _require_admin_user(request)
-    try:
-        body = await request.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="JSON body required") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="JSON object required")
+    body = await deps.json_body(request)
     name = str(body.get("name") or "").strip()
     if not name or len(name) > MAX_NAME_LENGTH:
         raise HTTPException(
@@ -204,7 +196,7 @@ async def api_create_management_key(request: Request) -> JSONResponse:
             detail=f"name is required (at most {MAX_NAME_LENGTH} characters)",
         )
     privileges = parse_privileges(body.get("privileges"))
-    expires_at = _expiry(body.get("expires_in_days"))
+    expires_at = expiry_from_days(body.get("expires_in_days"))
     plaintext = generate_management_key()
     key_id = await deps.get_db().create_management_key(
         name=name,
@@ -242,7 +234,8 @@ async def api_delete_management_key(key_id: int, request: Request) -> JSONRespon
     return JSONResponse({"ok": True})
 
 
-def _expiry(value: Any) -> int | None:
+def expiry_from_days(value: Any) -> int | None:
+    """Unix time *value* days from now; None (never) for an empty value."""
     if value is None or value == "":
         return None
     try:

@@ -38,7 +38,8 @@ SQLite is the default and fits a single router. To move to PostgreSQL, see
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `SESSION_SECRET` | *(empty)* | Secret for signing session cookies, encrypting stored provider keys and the worker hub token, and peppering client API key hashes. Empty: cookies use a random secret kept in the database; the rest use a random secret kept in `SECRET_KEY_PATH` |
+| `SESSION_SECRET` | *(empty)* | Secret for signing session cookies, encrypting stored provider keys and the worker hub token, and peppering client API key hashes; each use gets its own key derived with HKDF. At least 32 characters (`openssl rand -base64 48`); the router refuses to start with a shorter one. Empty: cookies use a random secret kept in the database; the rest use a random secret kept in `SECRET_KEY_PATH` |
+| `SESSION_SECRET_PREVIOUS` | *(empty)* | The old `SESSION_SECRET` while changing it. Only read: provider keys, the worker hub token and client API keys stored under it are moved to the new secret (provider keys at startup, client keys on first use). Remove it once every client key has been used. Sessions signed with the old secret end |
 | `SECRET_KEY_PATH` | *(empty)* | File holding the generated secret when `SESSION_SECRET` is empty, created with mode 0600 and never stored in the database. Empty: `secret.key` beside the SQLite database (`/app/data/secret.key` in the Docker image). Back it up with the database: without it stored provider keys must be entered again and client API keys reissued |
 | `DASHBOARD_COOKIE_SECURE` | `false` | Always send session cookies over HTTPS only. Without it they are Secure whenever the request came over HTTPS or with `X-Forwarded-Proto: https` |
 | `DASHBOARD_TRUSTED_ORIGINS` | *(empty)* | Comma-separated extra origins (`https://llm.example.org`) allowed to POST to the dashboard. The dashboard refuses state-changing requests whose `Sec-Fetch-Site` or `Origin` says they come from another site; needed only behind a plain-HTTP proxy that rewrites `Host` without setting `X-Forwarded-Host`. `OIDC_REDIRECT_BASE_URL` is always trusted |
@@ -46,6 +47,8 @@ SQLite is the default and fits a single router. To move to PostgreSQL, see
 | `ADMIN_PASSWORD` | *(empty)* | That administrator's password, at least 8 characters |
 | `MAX_API_KEYS_PER_USER` | `20` | Most API keys one user may issue themselves on My API keys (0: no limit). Keys an admin issues don't count |
 | `MAX_CHAT_CONVERSATIONS_PER_USER` | `500` | Most chat conversations one user may keep; past it they must delete one to start another (0: no limit) |
+| `DASHBOARD_WEBAUTHN_ORIGIN` | *(empty)* | Fixed external origin, e.g. `https://llm.example.org`, without a path or trailing slash. Enables WebAuthn enrollment. Must use a hostname and HTTPS; `http://localhost:PORT` is allowed for development. The hostname becomes the relying party ID; changing it requires re-enrollment |
+| `DASHBOARD_REQUIRE_SECOND_FACTOR` | `false` | Require a second factor for every local dashboard user, including admins. Requires `DASHBOARD_WEBAUTHN_ORIGIN`. Users without an authenticator must enroll after entering their password, before dashboard access. Existing password-only sessions must sign in again. SSO accounts are exempt |
 | `OIDC_ISSUER` | *(empty)* | OpenID Connect issuer URL. Empty turns single sign-on off |
 | `OIDC_CLIENT_ID` | *(empty)* | Client ID |
 | `OIDC_CLIENT_SECRET` | *(empty)* | Client secret |
@@ -74,7 +77,7 @@ SQLite is the default and fits a single router. To move to PostgreSQL, see
 | `OLLAMA_API_TRANSLATION` | `true` | Serve Ollama API requests from OpenAI-compatible providers too, translating both ways |
 | `SESSION_AFFINITY_ENABLED` | `true` | Keep each conversation on one provider. An API key can override this |
 | `SESSION_AFFINITY_TTL_SECONDS` | `1800` | A session forgets its provider after this long without a request |
-| `SESSION_AFFINITY_MAX_SESSIONS` | `1000` | Most sessions remembered at once; the least recently used are dropped first |
+| `SESSION_AFFINITY_MAX_SESSIONS` | `10000` | Most sessions remembered at once; the least recently used are dropped first |
 | `SPEND_ESTIMATE_COMPLETION_TOKENS` | `4096` | Output tokens assumed for a priced cloud request that sets no `max_tokens`. On a key with a daily spend cap, the estimated cost is held against the cap while the request runs; a response that reports no usage is charged the estimate |
 | `SESSION_AFFINITY_MAX_SESSIONS_PER_KEY` | `200` | Most sessions one API key (or one client address, for requests without a key) may hold; its least recently used go first |
 | `DECISION_POLICY_TIMEOUT_SECONDS` | `3.0` | Longest an API key's decision policy may take. After that a policy with gates refuses the request (503); a tier-only policy routes it as asked |
@@ -145,7 +148,7 @@ together pins the link and locks the dashboard form.
 | `WORKER_MAX_BODY_BYTES_IN_FLIGHT` | `268435456` (256 MiB) | Request bodies the worker buffers at once across all jobs; a job that would go over is refused with 503 |
 | `WORKER_ALLOW_ADMIN` | `false` | Let the hub pull and delete models on this worker |
 | `WORKER_EXPOSE` | *(dashboard; `combined`)* | `combined`: the hub sees this worker as one provider. `individual`: each shared provider on its own |
-| `WORKER_RESPONSE_BUFFER_BYTES` | `16777216` (16 MiB) | Hub: response bytes held per job for a slow client. When full the hub stops reading from that worker; a job still full after 30 s is failed |
+| `WORKER_RESPONSE_BUFFER_BYTES` | `16777216` (16 MiB) | Hub: response bytes held per job for a slow client. A job whose client falls this far behind is failed and cancelled on the worker; other jobs on the same worker are unaffected |
 | `WORKER_MAX_RESPONSE_BYTES` | `1073741824` (1 GiB) | Hub: largest response one job may send back; a larger one is cut off with an error |
 | `WORKER_MAX_SHARED_PROVIDERS` | `256` | Hub: providers one worker may share individually, counting ones it stopped sharing that are not yet deleted |
 | `WORKER_CATALOG_MIN_INTERVAL_SECONDS` | `5` | Hub: a worker's provider list is applied at most this often; only the latest list in between is used |
@@ -195,4 +198,4 @@ deprecated `HUGGING_FACE_HUB_TOKEN` and `HUGGINGFACE_HUB_CACHE`.
 |----------|---------|---------|
 | `TZ` | system | Timezone for dashboard timestamps, e.g. `America/New_York` |
 | `APP_VERSION` | `latest` | Image tag `docker-compose.prod.yaml` runs |
-| `LLAMA_ROUTER_TEST_DATABASE_URL` | *(empty)* | Tests only: run database tests against this server instead of a temporary SQLite file. It is emptied before every test |
+| `LLAMA_ROUTER_TEST_DATABASE_URL` | *(empty)* | Tests only: run database tests against this server instead of a temporary SQLite file. Its tables are emptied before every test |

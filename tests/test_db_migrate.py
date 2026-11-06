@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -113,6 +114,72 @@ def _alembic_cfg(sync_url: str):
     cfg.set_main_option("script_location", str(pkg / "alembic"))
     cfg.set_main_option("sqlalchemy.url", sync_url)
     return cfg
+
+
+@pytest.mark.parametrize("keep_key", [False, True])
+def test_api_key_sequence_starts_above_retained_logs(
+    tmp_path: Path, keep_key: bool
+) -> None:
+    """Upgrade populated and empty key tables without reusing deleted key IDs."""
+    dbfile = tmp_path / "key_sequence.db"
+    sync_url = f"sqlite:///{dbfile}"
+    command.upgrade(_alembic_cfg(sync_url), "026_session_version")
+    with contextlib.closing(sqlite3.connect(dbfile)) as con, con:
+        if keep_key:
+            con.execute(
+                "INSERT INTO api_keys (id, key_prefix, key_hash) "
+                "VALUES (1, 'kept', 'kept')"
+            )
+            con.execute(
+                "INSERT INTO api_key_decision_policies (api_key_id, policy) "
+                "VALUES (1, '{}')"
+            )
+        con.execute(
+            "INSERT INTO api_keys (id, key_prefix, key_hash) VALUES (9, 'old', 'old')"
+        )
+        con.execute(
+            "INSERT INTO request_log (protocol, endpoint, api_key_id) "
+            "VALUES ('ollama', '/private-request', 9)"
+        )
+        con.execute("DELETE FROM api_keys WHERE id = 9")
+
+    run_upgrade_sync(sync_url)
+    with contextlib.closing(sqlite3.connect(dbfile)) as con, con:
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute("INSERT INTO api_keys (key_prefix, key_hash) VALUES ('new', 'new')")
+        assert con.execute(
+            "SELECT id FROM api_keys WHERE key_hash = 'new'"
+        ).fetchone() == (10,)
+        assert con.execute("SELECT api_key_id FROM request_log").fetchall() == [(9,)]
+        if keep_key:
+            assert con.execute(
+                "SELECT policy FROM api_key_decision_policies"
+            ).fetchall() == [("{}",)]
+            con.execute("DELETE FROM api_keys WHERE id = 1")
+            assert (
+                con.execute("SELECT * FROM api_key_decision_policies").fetchall() == []
+            )
+        assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_upgrade_drops_impossible_benchmark_speeds(tmp_path: Path) -> None:
+    dbfile = tmp_path / "bench.db"
+    sync_url = f"sqlite:///{dbfile}"
+    command.upgrade(_alembic_cfg(sync_url), "028_dashboard_mfa")
+    with contextlib.closing(sqlite3.connect(dbfile)) as con, con:
+        con.execute("INSERT INTO providers (id, name) VALUES (1, 'p')")
+        con.executemany(
+            "INSERT INTO benchmarks (provider_id, model_name, tokens_per_second) "
+            "VALUES (1, ?, ?)",
+            [("good", 42.0), ("bogus", 199_000_000_000.0), ("none", None)],
+        )
+
+    run_upgrade_sync(sync_url)
+    with contextlib.closing(sqlite3.connect(dbfile)) as con, con:
+        rows = con.execute(
+            "SELECT model_name FROM benchmarks ORDER BY model_name"
+        ).fetchall()
+    assert rows == [("good",), ("none",)]
 
 
 def test_upgrade_from_wireguard_schema_keeps_providers(
@@ -529,3 +596,32 @@ def test_existing_install_keeps_anonymous_access(
         con.close()
     run_upgrade_sync(sync_url)
     assert _anonymous_setting(dbfile) == "true"
+
+
+def test_webauthn_upgrade_preserves_existing_account_security(tmp_path: Path) -> None:
+    dbfile = tmp_path / "before_webauthn.db"
+    sync_url = f"sqlite:///{dbfile}"
+    cfg = _alembic_cfg(sync_url)
+    command.upgrade(cfg, "027_api_key_autoincrement")
+    con = sqlite3.connect(dbfile)
+    try:
+        con.execute(
+            "INSERT INTO dashboard_users "
+            "(username, password_hash, is_admin, session_version, approved) "
+            "VALUES ('alice', 'existing-password-hash', 1, 7, 1)"
+        )
+        con.commit()
+    finally:
+        con.close()
+    run_upgrade_sync(sync_url)
+    con = sqlite3.connect(dbfile)
+    try:
+        assert con.execute(
+            "SELECT password_hash, session_version, approved, mfa_enabled "
+            "FROM dashboard_users WHERE username = 'alice'"
+        ).fetchone() == ("existing-password-hash", 7, 1, 0)
+        assert con.execute("SELECT version_num FROM alembic_version").fetchall() == [
+            (HEAD,)
+        ]
+    finally:
+        con.close()

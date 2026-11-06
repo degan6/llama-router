@@ -32,7 +32,7 @@ Everything lives in the `llama_router` package under `src/`:
 | `decisions.py`, `decision_service.py`, `decision_policy.py` | Decision models (`/v1/systemone`) and per-key decision policies |
 | `cloud_presets.py`, `pricing.py`, `spend.py` | Cloud service presets, request cost and spend caps |
 | `hf_download.py` | Hugging Face GGUF downloads |
-| `database.py`, `db_*.py`, `alembic/` | Async SQLAlchemy storage and migrations (SQLite, PostgreSQL, MySQL) |
+| `database.py`, `repositories/`, `db_*.py`, `alembic/` | Async SQLAlchemy storage and migrations (SQLite, PostgreSQL, MySQL) |
 | `migrate_sqlite_to_postgres.py` | The `llama-router-migrate-sqlite-pg` command |
 | `provider_secrets.py`, `auth.py` | Encryption of provider keys, API-key authentication |
 | `sentry.py` | Optional Sentry reporting |
@@ -157,7 +157,7 @@ Every health check times each address. The router keeps a running tally per addr
 
 The table is rebuilt whenever one of its inputs changes: models are discovered or deleted, a provider changes status, an address goes up or down, a benchmark is added or removed, a fallback or provider is edited, a probe runs, the set of loaded models changes, or new round-trip and request measurements arrive. Changes within a quarter of a second are batched into one rebuild, and rebuilds run at most once a second. Measurement-only rebuilds reuse the last database read.
 
-Resolved API keys are cached for five minutes. Creating or deleting a key, editing its pins, or changing the authentication policy takes effect on the next request.
+Resolved API keys and the authentication policy are cached for five minutes, and keys the router does not know for 30 seconds. Creating or deleting a key, editing its pins, or changing the authentication policy takes effect on the next request; other routers sharing the database pick the change up when their cache expires.
 
 Inspect the current table, with each candidate's inputs and scores, or force a rebuild:
 
@@ -170,7 +170,7 @@ The **API Keys** tab shows each model's first choice per mode for `/v1/chat/comp
 
 ### Explaining a route
 
-The **Route Explorer** on the **API Keys** tab shows where a request would go right now, and why, without sending it. Pick a model, an endpoint, and a service level: a routing mode, or an API key to apply that key's mode, fallback setting and pins. It walks the fallback chain and lists every provider that has the model, with its score, the live queue, the measurements behind the score, and why any provider was left out. A provider can be left out because it is offline, doesn't serve that API, is failing, is missing the endpoint, or because another provider is pinned. The explanation uses the same table and code path as real requests.
+The **Route Explorer** on the **Routing** tab (in the **Access** menu) shows where a request would go right now, and why, without sending it. Pick a model, an endpoint, and a service level: a routing mode, or an API key to apply that key's mode, fallback setting and pins. It walks the fallback chain and lists every provider that has the model, with its score, the live queue, the measurements behind the score, and why any provider was left out. A provider can be left out because it is offline, doesn't serve that API, is failing, is missing the endpoint, or because another provider is pinned. The explanation uses the same table and code path as real requests.
 
 The same is available as JSON:
 
@@ -509,9 +509,65 @@ Each provider can also carry extra headers (one `Name: value` per line) and mode
 - **Big catalogs.** A provider's **Model filter** (patterns such as `anthropic/claude-*`, one per line) keeps only the listed models that match; models added by hand are always kept. The OpenRouter preset starts with a filter for the main model families.
 - **Slow responses.** A provider's **Read timeout** replaces the default 120 seconds.
 
+## Second factor for local dashboard accounts
+
+Local accounts support password + WebAuthn without an SSO provider. Use a
+passkey (Touch ID, Windows Hello or a phone) or a security key supporting user
+verification with a PIN or biometrics. There is no rotating code to type.
+
+Serve the dashboard at a stable HTTPS hostname and configure:
+
+```dotenv
+LLAMA_ROUTER_DASHBOARD_WEBAUTHN_ORIGIN=https://llm.example.org
+LLAMA_ROUTER_DASHBOARD_COOKIE_SECURE=true
+LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR=true
+```
+
+The origin has no path or trailing slash. The server checks it explicitly;
+it never derives the WebAuthn identity from request or forwarded headers.
+HTTP is supported only on `localhost` for development. Changing the hostname
+requires registering authenticators again.
+
+With enforcement enabled, **every local user, including administrators, must
+complete second factor**. Existing password-only sessions must sign in again.
+Users without a registered authenticator enter their password and go through
+restricted enrollment before getting dashboard access. Create the first
+administrator using `LLAMA_ROUTER_ADMIN_USERNAME` and
+`LLAMA_ROUTER_ADMIN_PASSWORD` before startup.
+SSO accounts continue to follow the identity provider's authentication policy.
+API keys and management keys keep their existing authentication.
+
+Set `LLAMA_ROUTER_DASHBOARD_REQUIRE_SECOND_FACTOR=false` to make enrollment
+optional. Users can enroll on their **Account** page, opened by clicking their
+username. Once enrolled, that account always requires its second factor even
+when the global policy is optional. Turning the policy off does not remove anyone's authenticators.
+
+The Account page lets users register several named authenticators, remove a
+replaced device and generate recovery codes. Register a replacement before
+removing the last authenticator. Enrollment and device removal revoke older
+sessions.
+
+Save the ten recovery codes displayed after first enrollment. Each is a
+single-use alternative to WebAuthn **after entering the password**. Only hashes
+are stored; generating new codes invalidates the previous set. A recovery login
+opens the Account page so you can add a replacement device.
+
+If all devices and recovery codes are lost, an operator with access to the
+server can reset a local user's second factor:
+
+```bash
+docker compose exec llama-router llama-router --reset-dashboard-second-factor USERNAME
+```
+
+Outside Docker, run `llama-router --reset-dashboard-second-factor USERNAME`
+with the same database configuration as the server. This deletes that user's
+WebAuthn credentials and recovery codes and revokes their sessions and pending
+logins. It leaves their password unchanged. If enforcement is enabled, the user
+must enroll again after entering their password.
+
 ## Single sign-on (OpenID Connect)
 
-The dashboard can sign people in through an OpenID Connect provider such as Authentik, Keycloak, Okta, Entra ID or dex. Members of an admin group become administrators. Everyone else who signs in is a read-only viewer who may chat and [issue themselves API keys](#keys-users-issue-themselves). Local accounts keep working alongside SSO unless you turn password sign-in off.
+The dashboard can sign people in through an OpenID Connect provider such as Authentik, Keycloak, Okta, Entra ID or dex. Members of an admin group become administrators. Everyone else who signs in is a read-only viewer who may chat and [issue themselves API keys](#keys-users-issue-themselves). The **Log** tab shows viewers only requests made with their own current API keys; requests without a key or with a deleted key remain admin-only. Backend error details are shown only to admins. Local accounts keep working alongside SSO unless you turn password sign-in off.
 
 Register a confidential client at your provider with this redirect URI:
 
@@ -652,6 +708,10 @@ curl http://localhost/v1/chat/completions -H 'API-KEY: lr_...' \
 A request goes to the API when its path and method match an API route; the rest goes to the dashboard. `GET /decisions` is the dashboard page and `POST /decisions` is the API. `/health` stays the dashboard's.
 
 API requests on the dashboard port are checked by API key, not by dashboard login. Anyone who can reach port 80 can reach the API, so require API keys (leave unauthenticated access off) before exposing it.
+
+### Behind a reverse proxy
+
+Set `LLAMA_ROUTER_TRUSTED_PROXIES` to the proxy's address (IPs or CIDRs, comma-separated) whenever the router sits behind a reverse proxy. The router believes `X-Forwarded-For` only from those addresses; without the setting every client appears as the proxy, so one person's failed sign-ins throttle everyone and the request log shows only the proxy. The router logs a warning the first time a sign-in arrives with `X-Forwarded-For` from an address not in the list.
 
 ### Requests without an API key
 
@@ -819,13 +879,13 @@ Linting (ruff, mypy, yamllint, actionlint, hadolint, gitleaks and more) runs thr
 
 ### Tests
 
-Tests use a temporary SQLite file. To run the database-backed tests against PostgreSQL, MySQL or MariaDB instead, point them at a throwaway database. It is emptied before every test:
+Tests use a copy of a migrated SQLite file. `pytest -n auto` runs them in parallel, as CI does. To run them against PostgreSQL, MySQL or MariaDB instead, point them at a throwaway database (one at a time, without `-n`). Its tables are emptied before every test:
 
 ```bash
-LLAMA_ROUTER_TEST_DATABASE_URL=mysql+asyncmy://root:pw@127.0.0.1:3306/lr pytest --no-cov tests/test_database.py tests/test_routing_table.py
+LLAMA_ROUTER_TEST_DATABASE_URL=mysql+asyncmy://root:pw@127.0.0.1:3306/lr pytest --no-cov
 ```
 
-A few dashboard tests drive the app through a synchronous test client and fail against a server database with "attached to a different loop"; that is the test client, not the database.
+CI runs the whole suite against PostgreSQL and MySQL as well as SQLite.
 
 ## License
 

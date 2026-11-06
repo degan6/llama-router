@@ -8,7 +8,7 @@ import pytest
 from starlette.requests import Request
 
 from llama_router import request_logger
-from llama_router.auth import key_hash, routing_preferences_from_request
+from llama_router.auth import generate_api_key, routing_preferences_from_request
 from llama_router.background import drain
 from llama_router.database import Database
 from llama_router.models import (
@@ -18,9 +18,11 @@ from llama_router.models import (
     ProviderStatus,
 )
 from llama_router.provider_manager import ProviderManager
+from llama_router.provider_secrets import key_hash
 from llama_router.router import Router, RoutingPreferences
 from llama_router.routing_stats import WARM_WINDOW_S, ProviderStats
 from llama_router.routing_table import fallback_chains
+from tests.conftest import asgi_client
 
 
 class FakeClock:
@@ -150,7 +152,9 @@ async def test_unchanged_status_does_not_dirty_table(db: Database, pm: ProviderM
 
 
 async def test_background_rebuild_coalesces_bursts(db: Database, pm: ProviderManager):
-    rt = Router(db, pm, debounce_s=0.05, min_interval_s=0.0)
+    # Wide enough that the writes below land in one window even on a busy
+    # machine running tests in parallel.
+    rt = Router(db, pm, debounce_s=0.5, min_interval_s=0.0)
     await rt.start()
     try:
         start_version = rt.table.version
@@ -159,7 +163,7 @@ async def test_background_rebuild_coalesces_bursts(db: Database, pm: ProviderMan
         for i in range(10):
             await db.set_model_fallback(f"a{i}", "m")
         await db.set_provider_models(p.id, [ProviderModel(provider_id=p.id, name="m")])
-        for _ in range(100):
+        for _ in range(250):
             await asyncio.sleep(0.02)
             if rt.table.version > start_version and not rt._wake.is_set():
                 r = rt.route_with(rt.table, "a3", "/v1/chat/completions")
@@ -329,8 +333,6 @@ async def test_chaos_uses_table(db: Database, pm: ProviderManager):
 
 
 async def test_dashboard_routing_table_endpoint(db: Database, pm: ProviderManager):
-    from fastapi.testclient import TestClient
-
     from llama_router.dashboard import deps as dash_deps
     from llama_router.dashboard.app import app as dash_app
 
@@ -339,8 +341,8 @@ async def test_dashboard_routing_table_endpoint(db: Database, pm: ProviderManage
     pm.attach_router(rt)
     await rt.rebuild()
     dash_deps.init(db, pm)
-    with TestClient(dash_app) as client:
-        data = client.get("/api/routing-table").json()
+    async with asgi_client(dash_app) as client:
+        data = (await client.get("/api/routing-table")).json()
     assert data["models"]["m"]["/v1/chat/completions"]["ranked"]["balanced"] == ["srv"]
 
 
@@ -437,7 +439,7 @@ def _key_request(key: str) -> Request:
 
 
 async def test_api_key_is_cached_and_invalidated(db: Database, monkeypatch):
-    key = "lrk_test-key-value"
+    key = generate_api_key()
     key_id = await db.create_api_key("lrk_test", key_hash(key), "throughput", True)
     await db.set_allow_unauthenticated(False)
 
@@ -521,7 +523,8 @@ async def test_own_worker_relay_needs_no_key(db: Database):
 
 
 async def test_legacy_sha256_keys_still_work(db: Database):
-    key = "lrk_legacy"
+    # A fixed, well-formed test key (not a generated secret).
+    key = "lrk_" + "legacy" * 7 + "x"
     await db.create_api_key(
         "lrk_legacy", hashlib.sha256(key.encode()).hexdigest(), "latency", False
     )
@@ -561,7 +564,7 @@ async def test_raw_name_requests_use_discovered_name_for_stats(
 
 
 async def test_key_deleted_during_lookup_is_not_cached(db: Database, monkeypatch):
-    key = "lrk_racing"
+    key = generate_api_key()
     key_id = await db.create_api_key("lrk_racing", key_hash(key), "latency", True)
     await db.set_allow_unauthenticated(False)
     orig = db.lookup_api_key
@@ -584,3 +587,33 @@ async def test_key_deleted_during_lookup_is_not_cached(db: Database, monkeypatch
     with pytest.raises(HTTPException) as err:
         await routing_preferences_from_request(db, _key_request(key))
     assert err.value.status_code == 401
+
+
+async def test_failed_build_raises_once_then_recovers_with_fresh_data(
+    db: Database, pm: ProviderManager, monkeypatch: pytest.MonkeyPatch
+):
+    from llama_router import routing_table
+
+    old = await _provider(db, "old", ["m"])
+    rt = Router(db, pm)
+    assert (await rt.route("m", "/api/chat")).provider.id == old.id
+
+    real = routing_table.reload
+    calls = 0
+
+    def flaky(*args: Any, **kw: Any):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("build failed")
+        return real(*args, **kw)
+
+    monkeypatch.setattr(routing_table, "reload", flaky)
+    new = await _provider(db, "new", ["fresh"])
+    with pytest.raises(RuntimeError, match="build failed"):
+        await rt.route("fresh", "/api/chat")
+    # The failed build left the table dirty; the next request rebuilds it.
+    r = await rt.route("fresh", "/api/chat")
+    assert r is not None
+    assert r.provider.id == new.id
+    assert calls == 2

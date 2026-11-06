@@ -18,20 +18,15 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from ..auth import generate_api_key, key_hash, key_prefix
+from ..auth import generate_api_key, key_prefix
 from ..config import settings
 from ..database import Database
+from ..provider_secrets import key_hash
 from ..router import ROUTING_MODES
 from ..routing_table import DEFAULT_MODE
 from . import deps, management_keys
-from .routes import (
-    _key_locality,
-    _tristate,
-    _usd,
-    _utc_day_start,
-    merge_dash_template_ctx,
-    templates,
-)
+from .form_values import _key_label, _key_locality, _tristate, _usd, _utc_day_start
+from .pages import dash_page_ctx, templates
 
 router = APIRouter()
 
@@ -61,20 +56,10 @@ def _owner_id(request: Request) -> int:
     return int(user.id)
 
 
-async def _body(request: Request) -> dict[str, Any]:
-    try:
-        body = await request.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="body must be JSON") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="body must be a JSON object")
-    return body
-
-
 @router.get("/my-keys", response_class=HTMLResponse)
 async def my_keys_page(request: Request) -> Response:
     return templates.TemplateResponse(
-        request, "my_keys.html", merge_dash_template_ctx(request, {})
+        request, "my_keys.html", await dash_page_ctx(request, {})
     )
 
 
@@ -96,12 +81,13 @@ async def list_my_keys(request: Request) -> JSONResponse:
 @router.post("/api/my-keys")
 async def issue_my_key(request: Request) -> JSONResponse:
     owner = _owner_id(request)
-    body = await _body(request)
+    body = await deps.json_body(request)
     routing_mode = str(body.get("routing_mode") or DEFAULT_MODE).strip().lower()
     if routing_mode not in ROUTING_MODES:
         raise HTTPException(status_code=400, detail="Invalid routing_mode")
     allow_fallback = bool(body.get("allow_fallback", True))
     session_affinity = _tristate(body.get("session_affinity"))
+    label = _key_label(body.get("label"))
     db = deps.get_db()
     limit = settings.max_api_keys_per_user
     if limit > 0 and len(await db.list_api_keys(owner_user_id=owner)) >= limit:
@@ -122,11 +108,13 @@ async def issue_my_key(request: Request) -> JSONResponse:
         locality=defaults["locality"],
         daily_spend_cap_usd=defaults["daily_spend_cap_usd"],
         owner_user_id=owner,
+        label=label,
     )
     return JSONResponse(
         {
             "id": key_id,
             "api_key": plaintext,
+            "label": label,
             "routing_mode": routing_mode,
             "allow_fallback": allow_fallback,
             "session_affinity": session_affinity,
@@ -154,7 +142,7 @@ async def get_self_service_defaults() -> JSONResponse:
 async def set_self_service_defaults(request: Request) -> JSONResponse:
     """Body: {locality: local|cloud|any, daily_spend_cap_usd: number|null}.
     Applies to keys issued from now on, not to existing ones."""
-    body = await _body(request)
+    body = await deps.json_body(request)
     locality = _key_locality(body.get("locality"))
     cap = _usd(body.get("daily_spend_cap_usd"), "daily spend cap")
     db = deps.get_db()

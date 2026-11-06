@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
+from llama_router import ollama_client
 from llama_router.llamacpp_client import OpenAIClient, _chat_metrics
 from llama_router.ollama_client import OllamaClient, _human_bytes
-from llama_router.v1_client import V1Client
+from llama_router.v1_client import MultipartForm, V1Client
 
 
 class Recorder:
@@ -144,10 +146,12 @@ async def test_ollama_streams_and_binary_proxies() -> None:
     assert await collect(c.v1_completions_stream({})) == b"d"
     assert await collect(c.v1_responses_stream({})) == b"r"
     assert await collect(c.v1_audio_speech({})) == b"mp3"
-    resp = await c.v1_images_edits(b"data", "multipart/form-data; boundary=x")
+    resp = await c.v1_images_edits(
+        MultipartForm({"model": "m"}, [("image", ("a.png", b"data", "image/png"))])
+    )
     assert resp.content == b"img"
     assert rec.requests[-1].headers["content-type"].startswith("multipart")
-    assert (await c.v1_audio_transcriptions(b"d", "audio/wav")).json() == {"text": "hi"}
+    assert (await c.v1_audio_transcriptions(MultipartForm())).json() == {"text": "hi"}
     await c.close()
 
 
@@ -275,6 +279,37 @@ async def test_ollama_benchmarks() -> None:
     await c.close()
 
 
+async def test_ollama_chat_benchmark_without_eval_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that leaves out eval_duration must not yield count / 1 ns."""
+    rec = Recorder(
+        {
+            "/api/chat": _json(
+                {
+                    "eval_count": 199,
+                    "total_duration": 4_000_000_000,
+                    "load_duration": 0,
+                    "prompt_eval_duration": 2_000_000_000,
+                }
+            ),
+        }
+    )
+    c = OllamaClient("http://o", transport=rec.transport)
+    assert await c.benchmark_chat("m", "hi") == {
+        "startup_time_ms": 0.0,
+        "tokens_per_second": 99.5,
+    }
+    # No durations at all: fall back to the measured wall time.
+    clock = iter([10.0, 12.0])
+    monkeypatch.setattr(
+        ollama_client, "time", SimpleNamespace(monotonic=lambda: next(clock))
+    )
+    rec.routes["/api/chat"] = _json({"eval_count": 199})
+    assert (await c.benchmark_chat("m", "hi"))["tokens_per_second"] == 99.5
+    await c.close()
+
+
 def test_human_bytes() -> None:
     assert _human_bytes(1 << 10) == "1 KB"
     assert _human_bytes(1 << 20) == "1.0 MB"
@@ -370,10 +405,8 @@ async def test_openai_calls_and_streams() -> None:
     assert await c.embeddings({}) == {"ok": True}
     assert await c.images_generations({}) == {"ok": True}
     assert await c.audio_voices() == {"ok": True}
-    assert (await c.images_edits(b"d", "multipart/form-data")).content == b"img"
-    assert (await c.audio_transcriptions(b"d", "multipart/form-data")).json() == {
-        "ok": True
-    }
+    assert (await c.images_edits(MultipartForm())).content == b"img"
+    assert (await c.audio_transcriptions(MultipartForm())).json() == {"ok": True}
     assert b"".join([x async for x in c.audio_speech({})]) == b"wav"
     for stream in (c.chat_completions_stream, c.completions_stream, c.responses_stream):
         body = {}
@@ -454,8 +487,8 @@ async def test_v1client_falls_back_to_ollama() -> None:
     assert await v1.responses({}) == want
     assert await v1.images_generations({}) == want
     assert await v1.audio_voices() == want
-    assert (await v1.images_edits(b"", "x/y")).content == b"i"
-    assert (await v1.audio_transcriptions(b"", "x/y")).json() == want
+    assert (await v1.images_edits(MultipartForm())).content == b"i"
+    assert (await v1.audio_transcriptions(MultipartForm())).json() == want
     for stream in (
         v1.chat_completions_stream,
         v1.completions_stream,
@@ -494,8 +527,8 @@ async def test_v1client_llamacpp_paths() -> None:
     assert await v1.responses({}) == want
     assert await v1.images_generations({}) == want
     assert await v1.audio_voices() == want
-    assert (await v1.images_edits(b"", "x/y")).content == b"i"
-    assert (await v1.audio_transcriptions(b"", "x/y")).json() == want
+    assert (await v1.images_edits(MultipartForm())).content == b"i"
+    assert (await v1.audio_transcriptions(MultipartForm())).json() == want
     for stream in (
         v1.chat_completions_stream,
         v1.completions_stream,

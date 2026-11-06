@@ -14,8 +14,9 @@ import pytest_asyncio
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.websockets import WebSocketDisconnect
 
-from llama_router import provider_manager as pm_mod
+from llama_router import worker_sync
 from llama_router.api import deps as api_deps
 from llama_router.api.app import app as api_app
 from llama_router.config import settings
@@ -38,6 +39,7 @@ from llama_router.worker_link.worker import (
     normalize_hub_url,
     path_allowed,
 )
+from tests.conftest import FakeClock
 
 # --- pure helpers ---
 
@@ -79,6 +81,17 @@ def test_filter_headers_drops_hop_by_hop_and_credentials() -> None:
         ("GET", "/api/chat", False, False),
         ("POST", "/api/../admin", False, False),
         ("POST", "//api/chat", False, False),
+        ("POST", "/api/ch%61t", False, True),
+        ("POST", "/api/%2e%2e/admin", False, False),
+        ("POST", "/api/%2E%2E/api/pull", False, False),
+        ("GET", "/v1/models/a%2Fb", False, False),
+        ("GET", "/v1/models/a%2fb", False, False),
+        ("GET", "/v1/models/..", False, False),
+        ("GET", "/v1/models/%2e%2e", False, False),
+        ("GET", "/v1/models/./x", False, False),
+        ("GET", "/v1/models/a%252Fb", False, False),
+        ("POST", "/api/pull%3Fx", True, False),
+        ("GET", "/v1/models/llama3%3A8b", False, True),
         ("GET", "/users", True, False),
         ("POST", "/v1/systemone", False, True),
         ("POST", "/v1/decisions", False, True),
@@ -253,9 +266,21 @@ async def _wait_for(cond, timeout: float = 5.0) -> None:
     raise AssertionError("condition not met in time")
 
 
+def _fake_sleep(clock: FakeClock, slept: list[float] | None = None):
+    """An asyncio.sleep that moves *clock* on instead of waiting."""
+
+    async def sleep(seconds: float) -> None:
+        if slept is not None:
+            slept.append(seconds)
+        clock.t += seconds
+        await asyncio.sleep(0)
+
+    return sleep
+
+
 @pytest_asyncio.fixture
-async def link(tmp_path):
-    db = Database(str(tmp_path / "hub.db"))
+async def link(database_url):
+    db = Database(database_url)
     await db.connect()
     pm = ProviderManager(db)
     rt = Router(db, pm)
@@ -463,6 +488,36 @@ async def test_bad_token_is_rejected(link) -> None:
     assert not link["pm"].worker_hub.is_connected(link["provider_id"])
 
 
+async def test_expired_token_is_rejected(link) -> None:
+    db = link["db"]
+    await db.set_worker_token(
+        link["worker_id"],
+        worker_token_hash(link["token"]),
+        worker_token_prefix(link["token"]),
+        int(time.time()) - 1,
+    )
+    w = link["make_worker"]()
+    link["workers"].append(w)
+    w.start()
+    await _wait_for(lambda: w.state == "rejected")
+    assert not link["pm"].worker_hub.is_connected(link["provider_id"])
+
+
+async def test_session_closes_when_its_token_expires(link) -> None:
+    db = link["db"]
+    await db.set_worker_token(
+        link["worker_id"],
+        worker_token_hash(link["token"]),
+        worker_token_prefix(link["token"]),
+        int(time.time()) + 3,
+    )
+    w = await _connected_worker(link)
+    assert link["pm"].worker_hub.is_connected(link["provider_id"])
+    await _wait_for(lambda: w.state == "rejected", timeout=8)
+    assert w.last_error == "token expired"
+    assert not link["pm"].worker_hub.is_connected(link["provider_id"])
+
+
 async def test_disconnect_marks_offline_and_worker_reconnects(link) -> None:
     w = await _connected_worker(link)
     pm, pid, db = link["pm"], link["provider_id"], link["db"]
@@ -617,7 +672,7 @@ async def test_connect_with_failing_discovery_keeps_reachable_address_live(
 async def test_worker_health_check_steps_aside_and_is_bounded(
     link, monkeypatch
 ) -> None:
-    import llama_router.provider_manager as pm_mod
+    import llama_router.provider_health as health_mod
 
     await _connected_worker(link)
     pm, pid, db = link["pm"], link["provider_id"], link["db"]
@@ -637,7 +692,7 @@ async def test_worker_health_check_steps_aside_and_is_bounded(
     assert probed == []
 
     # A hung probe holds the lock only until the cap, then releases it.
-    monkeypatch.setattr(pm_mod, "_WORKER_CHECK_TIMEOUT", 0.2)
+    monkeypatch.setattr(health_mod, "_WORKER_CHECK_TIMEOUT", 0.2)
     pm._hot_models[pid] = [{"name": "stale"}]
 
     async def hung_probe(p, addr):
@@ -662,10 +717,10 @@ async def test_worker_health_check_steps_aside_and_is_bounded(
         caps.append(timeout)
         return await real_wait_for(coro, timeout)
 
-    monkeypatch.setattr(pm_mod.asyncio, "wait_for", spy)
+    monkeypatch.setattr(health_mod.asyncio, "wait_for", spy)
     pm._probe_address = real_probe
     await pm.check_provider(await db.get_provider(pid))
-    assert caps[0] == pm_mod._WORKER_MANUAL_TIMEOUT
+    assert caps[0] == health_mod._WORKER_MANUAL_TIMEOUT
 
 
 async def test_disconnected_worker_reason_and_no_relog(link) -> None:
@@ -731,13 +786,13 @@ async def test_disconnect_during_cycle_is_not_logged_twice(link) -> None:
 async def test_timeout_does_not_mark_reconnected_worker_offline(
     link, monkeypatch
 ) -> None:
-    import llama_router.provider_manager as pm_mod
+    import llama_router.provider_health as health_mod
 
     await _connected_worker(link)
     pm, pid, db = link["pm"], link["provider_id"], link["db"]
     await db.update_provider_status(pid, ProviderStatus.IDLE)
     provider = await db.get_provider(pid)
-    monkeypatch.setattr(pm_mod, "_WORKER_CHECK_TIMEOUT", 0.2)
+    monkeypatch.setattr(health_mod, "_WORKER_CHECK_TIMEOUT", 0.2)
     real_get = pm.worker_hub.get
     swapped = {"on": False}
 
@@ -756,7 +811,7 @@ async def test_timeout_does_not_mark_reconnected_worker_offline(
 
     # A manual refresh in the same situation still leaves a Log row.
     swapped["on"] = False
-    monkeypatch.setattr(pm_mod, "_WORKER_MANUAL_TIMEOUT", 0.2)
+    monkeypatch.setattr(health_mod, "_WORKER_MANUAL_TIMEOUT", 0.2)
     await pm.check_provider(await db.get_provider(pid), source="refresh")
     rows = [e for e in await db.get_request_logs(50, 0) if e.endpoint == "refresh"]
     assert rows
@@ -1450,44 +1505,50 @@ async def test_hub_cuts_off_a_response_over_the_ceiling(monkeypatch) -> None:
     assert conn._ws.text[-1] == {"type": "cancel", "id": 1}
 
 
-async def test_hub_stops_reading_while_a_client_falls_behind(monkeypatch) -> None:
-    from llama_router.worker_link import hub as hub_mod
-
+async def test_hub_aborts_only_the_stream_whose_client_falls_behind(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(settings, "worker_response_buffer_bytes", 10)
-    monkeypatch.setattr(hub_mod, "_STALL_TIMEOUT", 1.5)
     conn = _hub_conn()
-    pend, stream = await _open_response(conn)
+    pend, stream = await _open_response(conn, 1)
+    other, other_stream = await _open_response(conn, 2)
     await conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"a" * 6))
-    await conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"b" * 6))
-    # Full: the next frame waits for the client to read.
-    blocked = asyncio.create_task(
-        conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"c" * 6))
-    )
-    await asyncio.sleep(0.05)
-    assert not blocked.done()
     assert await stream.__anext__() == b"a" * 6
-    await asyncio.wait_for(blocked, 1)
-    assert pend.buffered == 12
-
-    # A client that stops reading altogether loses its response.
-    await conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"d" * 6))
-    with pytest.raises(httpx.ReadError, match="stopped reading"):
+    await conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"b" * 6))
+    # Over the buffer: the frame is handled at once (the read loop never
+    # waits on a client) and only that job is failed and cancelled.
+    await asyncio.wait_for(
+        conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"c" * 6)), 0.5
+    )
+    with pytest.raises(httpx.ReadError, match="fell behind"):
         await stream.__anext__()
-    assert conn.in_flight == 0
     assert pend.buffered == 0
+    assert conn._ws.text[-1] == {"type": "cancel", "id": 1}
+    assert conn.in_flight == 1
+
+    # The other job on the same socket carries on.
+    await conn._on_bytes(p.encode_binary(p.RESP_BODY, 2, b"z" * 4))
+    assert await other_stream.__anext__() == b"z" * 4
+    await conn._on_bytes(p.encode_binary(p.RESP_END, 2, b""))
+    with pytest.raises(StopAsyncIteration):
+        await other_stream.__anext__()
+    assert other.finished
 
 
 async def test_catalogs_are_applied_at_a_limited_rate_latest_first(
-    monkeypatch,
+    monkeypatch, clock
 ) -> None:
     from llama_router.worker_link.hub import WorkerHub
 
     monkeypatch.setattr(settings, "worker_catalog_min_interval_seconds", 0.3)
     hub = WorkerHub()
+    slept: list[float] = []
+    hub.clock = clock
+    hub.sleep = _fake_sleep(clock, slept)
     applied: list[tuple[float, list[int]]] = []
 
     async def on_catalog(conn) -> None:
-        applied.append((time.monotonic(), [e["id"] for e in conn.catalog]))
+        applied.append((clock(), [e["id"] for e in conn.catalog]))
 
     hub.set_callbacks(None, None, on_catalog)
     conn = _hub_conn(expose=p.EXPOSE_INDIVIDUAL, on_catalog=hub._catalog_received)
@@ -1503,10 +1564,12 @@ async def test_catalogs_are_applied_at_a_limited_rate_latest_first(
     send(1, 2, 3)
     send(1, 2, 3, 4)
     await _wait_for(lambda: len(applied) == 2)
-    await asyncio.sleep(0.4)
+    for _ in range(5):
+        await asyncio.sleep(0)
     # Only the newest of the three, and not before the interval was up.
     assert [ids for _, ids in applied] == [[1], [1, 2, 3, 4]]
-    assert applied[1][0] - applied[0][0] >= 0.25
+    assert [t for t, _ in applied] == [1000.0, pytest.approx(1000.3)]
+    assert slept == [pytest.approx(0.3)]
 
 
 async def test_catalog_is_capped(monkeypatch) -> None:
@@ -1534,8 +1597,10 @@ async def test_unshared_providers_are_deleted_after_a_while(link, monkeypatch) -
 
     await _wait_for(two)
     conn = pm.worker_hub.get(pid)
-    # About a third of a second.
-    monkeypatch.setattr(settings, "worker_unshared_purge_hours", 0.0001)
+    clock = FakeClock()
+    pm.clock = clock
+    pm.sleep = _fake_sleep(clock)
+    monkeypatch.setattr(settings, "worker_unshared_purge_hours", 1.0)
     conn.catalog = [catalog[0]]
     await pm._on_worker_catalog(conn)
     kids = await _children(link)
@@ -1547,6 +1612,7 @@ async def test_unshared_providers_are_deleted_after_a_while(link, monkeypatch) -
 
     # The purge timer syncs again once the grace period is over.
     await _wait_for(purged)
+    assert clock.t >= 1000.0 + 3600.0
     assert set(await _children(link)) == {"alice-gpu/gpu"}
 
 
@@ -1571,11 +1637,12 @@ async def test_unshared_providers_beyond_the_cap_go_at_once(link, monkeypatch) -
     assert by_rid == {7, 9}
 
 
-async def test_purge_timer_survives_a_reconnect(monkeypatch) -> None:
+async def test_purge_timer_survives_a_reconnect(monkeypatch, clock) -> None:
     """The timer syncs through whichever socket is current when it fires,
     not the one that scheduled it."""
     pm = ProviderManager(None)  # type: ignore[arg-type]
-    monkeypatch.setattr(settings, "worker_unshared_purge_hours", 0.00001)
+    pm.clock = clock
+    pm.sleep = _fake_sleep(clock)
     old, new = _hub_conn(), _hub_conn()
     synced: list[Any] = []
 
@@ -1593,9 +1660,11 @@ async def test_purge_timer_survives_a_reconnect(monkeypatch) -> None:
     assert synced == [new]
 
 
-async def test_purge_timer_retries_a_failed_sync(monkeypatch) -> None:
+async def test_purge_timer_retries_a_failed_sync(monkeypatch, clock) -> None:
     pm = ProviderManager(None)  # type: ignore[arg-type]
-    monkeypatch.setattr(settings, "worker_unshared_purge_hours", 0.00001)
+    slept: list[float] = []
+    pm.clock = clock
+    pm.sleep = _fake_sleep(clock, slept)
     conn = _hub_conn()
     calls: list[Any] = []
 
@@ -1605,10 +1674,11 @@ async def test_purge_timer_retries_a_failed_sync(monkeypatch) -> None:
             raise RuntimeError("database busy")
 
     monkeypatch.setattr(pm, "_on_worker_catalog", on_catalog)
-    monkeypatch.setattr(pm_mod, "_PURGE_RETRY_S", 0.0)
     pm.worker_hub._conns[1] = conn
     pm._schedule_purge(conn, 0.0)
     await _wait_for(lambda: len(calls) == 2)
+    # The retry waits _PURGE_RETRY_S (plus the timer's second of slack).
+    assert slept == [1.0, worker_sync._PURGE_RETRY_S + 1.0]
 
 
 async def test_catalog_sync_uses_the_catalog_it_started_with(link, monkeypatch) -> None:
@@ -1656,13 +1726,211 @@ async def test_purge_timer_waits_only_for_the_longest_unshared(
 
     await _wait_for(two)
     monkeypatch.setattr(settings, "worker_unshared_purge_hours", 1.0)
+    clock = FakeClock()
+    pm.clock = clock
     delays: list[float] = []
     monkeypatch.setattr(pm, "_schedule_purge", lambda conn, d: delays.append(d))
     conn = pm.worker_hub.get(pid)
     api = (await _children(link))["alice-gpu/api"]
     conn.catalog = [catalog[0]]
     # Unshared half an hour ago (by the hub's reckoning).
-    pm._unshared_since[api.require_id()] = time.monotonic() - 1800.0
+    pm._unshared_since[api.require_id()] = clock.t - 1800.0
     await pm._on_worker_catalog(conn)
-    assert len(delays) == 1
-    assert 1700.0 < delays[0] <= 1800.0
+    assert delays == [1800.0]
+
+
+# --- hostile or broken worker sockets ---
+
+
+class _HostileSocket:
+    """A worker socket that can stall or drop while the hub writes to it,
+    and whose incoming frames the test supplies."""
+
+    def __init__(self, *, stall: bool = False, drop: BaseException | None = None):
+        self.stall = stall
+        self.drop = drop
+        self.text: list[dict] = []
+        self.sent = asyncio.Event()
+        self.inbox: asyncio.Queue[dict] = asyncio.Queue()
+
+    async def send_text(self, data: str) -> None:
+        if self.stall:
+            await asyncio.Event().wait()
+        self.text.append(json.loads(data))
+        self.sent.set()
+
+    async def send_bytes(self, data: bytes) -> None:
+        if self.drop is not None:
+            raise self.drop
+
+    async def receive(self) -> dict:
+        return await self.inbox.get()
+
+
+def _conn_on(ws: _HostileSocket):
+    from llama_router.worker_link.hub import WorkerConnection
+
+    return WorkerConnection(
+        ws,
+        worker_id=1,
+        name="w",
+        provider_id=1,
+        protocols=["ollama"],
+        max_concurrency=2,
+        software_version=None,
+        remote_addr=None,
+    )
+
+
+def _job(read: float = 5.0, write: float = 5.0) -> httpx.Request:
+    timeout = {"connect": 5.0, "pool": 5.0, "read": read, "write": write}
+    return httpx.Request(
+        "POST",
+        "http://worker/api/chat",
+        content=b'{"model": "m"}',
+        extensions={"timeout": timeout},
+    )
+
+
+async def _read_into(response: httpx.Response, chunks: list[bytes]) -> None:
+    async for chunk in response.aiter_raw():
+        chunks.append(chunk)
+
+
+def _all_released(conn) -> bool:
+    return conn.in_flight == 0 and conn._slots._value == conn.max_concurrency
+
+
+async def test_stalled_socket_write_times_out(monkeypatch) -> None:
+    from llama_router.worker_link import hub as hub_mod
+
+    monkeypatch.setattr(hub_mod, "_CANCEL_TIMEOUT", 0.05)
+    conn = _conn_on(_HostileSocket(stall=True))
+    with pytest.raises(httpx.WriteTimeout):
+        # Bounded: telling a stuck worker to cancel must not hang either.
+        await asyncio.wait_for(conn.open("ollama", _job(write=0.05)), 2)
+    assert _all_released(conn)
+
+
+@pytest.mark.parametrize(
+    "drop", [RuntimeError("closed"), OSError("reset"), WebSocketDisconnect(1006)]
+)
+async def test_socket_closed_while_sending(drop: BaseException) -> None:
+    ws = _HostileSocket(drop=drop)
+    conn = _conn_on(ws)
+    with pytest.raises(httpx.WriteError):
+        await conn.open("ollama", _job())
+    assert _all_released(conn)
+    assert ws.text[-1] == {"type": "cancel", "id": 1}
+
+
+async def test_worker_that_never_answers_times_out() -> None:
+    ws = _HostileSocket()
+    conn = _conn_on(ws)
+    with pytest.raises(httpx.ReadTimeout):
+        await conn.open("ollama", _job(read=0.05))
+    assert _all_released(conn)
+    assert ws.text[-1] == {"type": "cancel", "id": 1}
+
+
+async def test_worker_that_stops_mid_body_times_out() -> None:
+    ws = _HostileSocket()
+    conn = _conn_on(ws)
+    opening = asyncio.create_task(conn.open("ollama", _job(read=0.05)))
+    await ws.sent.wait()
+    conn._on_text({"type": "response", "id": 1, "status": 200, "headers": []})
+    response = await opening
+    await conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"part"))
+    chunks: list[bytes] = []
+    with pytest.raises(httpx.ReadTimeout):
+        await _read_into(response, chunks)
+    assert chunks == [b"part"]
+    assert _all_released(conn)
+
+
+@pytest.mark.parametrize(
+    ("kind", "raised"),
+    [
+        ("connect", httpx.ConnectError),
+        ("timeout", httpx.ReadTimeout),
+        ("upstream", httpx.RemoteProtocolError),
+        (None, httpx.RemoteProtocolError),
+    ],
+)
+async def test_worker_error_before_headers(kind, raised) -> None:
+    ws = _HostileSocket()
+    conn = _conn_on(ws)
+    opening = asyncio.create_task(conn.open("ollama", _job()))
+    await ws.sent.wait()
+    conn._on_text({"type": "error", "id": 1, "kind": kind, "message": "boom"})
+    with pytest.raises(raised, match="worker: boom"):
+        await opening
+    assert _all_released(conn)
+
+
+async def test_worker_error_after_headers_ends_the_stream() -> None:
+    ws = _HostileSocket()
+    conn = _conn_on(ws)
+    opening = asyncio.create_task(conn.open("ollama", _job()))
+    await ws.sent.wait()
+    conn._on_text({"type": "response", "id": 1, "status": 200, "headers": []})
+    response = await opening
+    await conn._on_bytes(p.encode_binary(p.RESP_BODY, 1, b"part"))
+    conn._on_text({"type": "error", "id": 1, "kind": "upstream", "message": "gone"})
+    # A late response frame for the finished job changes nothing.
+    conn._on_text({"type": "response", "id": 1, "status": 500, "headers": []})
+    chunks: list[bytes] = []
+    with pytest.raises(httpx.ReadError, match="gone"):
+        await _read_into(response, chunks)
+    assert chunks == [b"part"]
+    assert _all_released(conn)
+
+
+_GARBAGE = [
+    {"type": "websocket.receive", "text": "not json"},
+    {"type": "websocket.receive", "text": "[1, 2]"},
+    {"type": "websocket.receive", "text": '{"id": 1}'},
+    {
+        "type": "websocket.receive",
+        "text": '{"type": "response", "id": 1, "status": "x"}',
+    },
+    {"type": "websocket.receive", "text": '{"type": "error", "id": "1"}'},
+    {"type": "websocket.receive", "text": '{"type": "mystery", "id": 1}'},
+    {"type": "websocket.receive", "bytes": b"\x03"},
+    {"type": "websocket.receive", "bytes": b""},
+    {"type": "websocket.receive", "bytes": p.encode_binary(p.RESP_BODY, 99, b"x")},
+    {"type": "websocket.receive", "bytes": p.encode_binary(77, 1, b"x")},
+]
+
+
+@pytest.mark.parametrize("after_headers", [False, True])
+async def test_undecodable_frames_are_skipped_until_the_socket_drops(
+    after_headers: bool,
+) -> None:
+    ws = _HostileSocket()
+    conn = _conn_on(ws)
+    reading = asyncio.create_task(conn.read_loop())
+    opening = asyncio.create_task(conn.open("ollama", _job()))
+    await ws.sent.wait()
+    if after_headers:
+        await ws.inbox.put(
+            {
+                "type": "websocket.receive",
+                "text": '{"type": "response", "id": 1, "status": 200}',
+            }
+        )
+        response = await opening
+    for frame in _GARBAGE:
+        await ws.inbox.put(frame)
+    await ws.inbox.put({"type": "websocket.disconnect", "code": 1006})
+    # The read loop survives every bad frame and returns on the disconnect.
+    await asyncio.wait_for(reading, 2)
+    assert not opening.done() or after_headers
+    conn.fail_all("socket closed")  # what the hub does when read_loop returns
+    if after_headers:
+        with pytest.raises(httpx.ReadError, match="disconnected"):
+            await response.aread()
+    else:
+        with pytest.raises(httpx.RemoteProtocolError, match="disconnected"):
+            await opening
+    assert _all_released(conn)

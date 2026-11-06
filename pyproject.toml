@@ -1,6 +1,6 @@
 [project]
 name = "llama-router"
-version = "0.27.0"
+version = "0.29.1"
 description = "An LLM router that aggregates Ollama and OpenAI-compatible backends behind unified APIs"
 readme = "README.md"
 license = "MIT"
@@ -28,6 +28,7 @@ dependencies = [
   "sentry-sdk[fastapi]>=2.20",
   "sqlalchemy[asyncio]>=2.0",
   "uvicorn[standard]>=0.34",
+  "webauthn>=3.0.1",
   "websockets>=13",
 ]
 
@@ -52,11 +53,13 @@ llama-router-migrate-sqlite-pg = "llama_router.migrate_sqlite_to_postgres:main"
 
 [dependency-groups]
 dev = [
+  "hypothesis>=6.170.14",
   "mypy>=2.4.0",
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.1",
   "pytest-cov>=7.1.0",
   "pytest-httpx>=0.36.2",
+  "pytest-xdist>=3.8.0",
 ]
 
 [build-system]
@@ -93,8 +96,7 @@ files = ["src", "tests", "scripts"]
 [[tool.mypy.overrides]]
 module = [
   "calib",
-  "llama_router.dashboard.routes",
-  "llama_router.database",
+  "llama_router.dashboard.routes.*",
   "llama_router.llamacpp_client",
   "llama_router.migrate_sqlite_to_postgres",
   "llama_router.ollama_client",
@@ -144,14 +146,17 @@ testpaths = ["tests"]
 xfail_strict = true
 markers = [
   "no_accounts_locked: keep the real locked dashboard when no accounts exist",
+  "allow_unauthenticated: the router fixture lets requests without a key in",
 ]
 
 [tool.coverage.run]
-source = ["llama_router"]
+# A path, not the package name, so the Alembic migrations (not imported as
+# part of the package) are measured too.
+source = ["src/llama_router"]
 branch = true
 
 [tool.coverage.report]
 # RULES.md §4 wants 80; raise this as coverage improves.
-fail_under = 80
+fail_under = 85
 skip_covered = true
 exclude_also = ['if __name__ == "__main__":']

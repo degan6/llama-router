@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from llama_router.config import settings
@@ -15,11 +17,15 @@ from llama_router.dashboard.auth_core import (
     verify_password,
 )
 from llama_router.dashboard.middleware import invalidate_dashboard_user_count_cache
-from llama_router.provider_secrets import ENCRYPTED_SETTING_PREFIX, decrypt_setting
+from llama_router.provider_secrets import (
+    ENCRYPTED_SETTING_PREFIX,
+    decrypt_setting,
+    session_signing_key,
+)
 
 
 def _session_cookie_header(user_id: int) -> dict[str, str]:
-    secret = settings.session_secret.strip()
+    secret = session_signing_key()
     token = sign_session(user_id, secret)
     return {"Cookie": f"{AUTH_COOKIE}={token}"}
 
@@ -437,7 +443,7 @@ async def test_session_for_deleted_user_rejected_when_accounts_remain(
     uid = await db.create_dashboard_user("gone", hash_password("password-12345"), True)
     await db.create_dashboard_user("other", hash_password("password-12345"), True)
     invalidate_dashboard_user_count_cache()
-    token = sign_session(uid, settings.session_secret.strip())
+    token = sign_session(uid, session_signing_key())
     await db.delete_dashboard_user(uid)
     invalidate_dashboard_user_count_cache()
 
@@ -452,7 +458,7 @@ async def test_deleting_last_dashboard_user_locks_the_dashboard(dash_client) -> 
     client, db = dash_client
     uid = await db.create_dashboard_user("only", hash_password("password-12345"), True)
     invalidate_dashboard_user_count_cache()
-    token = sign_session(uid, settings.session_secret.strip())
+    token = sign_session(uid, session_signing_key())
     await db.delete_dashboard_user(uid)
     invalidate_dashboard_user_count_cache()
 
@@ -521,8 +527,26 @@ async def test_admin_can_create_rotate_disable_and_delete_worker(dash_client) ->
     rot = await client.post(f"/api/workers/{body['id']}/rotate", headers=hdr)
     new_token = rot.json()["token"]
     assert new_token != token
+    assert rot.json()["token_expires_at"] is None
     assert await db.get_worker_by_token_hash(worker_token_hash(token)) is None
     assert await db.get_worker_by_token_hash(worker_token_hash(new_token)) is not None
+
+    # Rotating can set an expiry; the dashboard shows it.
+    rot = await client.post(
+        f"/api/workers/{body['id']}/rotate", headers=hdr, json={"expires_in_days": 7}
+    )
+    assert rot.status_code == 200, rot.text
+    expires = rot.json()["token_expires_at"]
+    assert abs(expires - (time.time() + 7 * 86400)) < 60
+    assert (await db.get_worker(body["id"]))["token_expires_at"] == expires
+    listed = (await client.get("/api/workers", headers=hdr)).json()["workers"]
+    assert listed[0]["token_expires_at"] == expires
+    assert listed[0]["token_expired"] is False
+    assert "expires " in (await client.get("/", headers=hdr)).text
+    bad = await client.post(
+        f"/api/workers/{body['id']}/rotate", headers=hdr, json={"expires_in_days": 0}
+    )
+    assert bad.status_code == 400
 
     dis = await client.post(
         f"/api/workers/{body['id']}/enabled", headers=hdr, json={"enabled": False}
@@ -534,6 +558,28 @@ async def test_admin_can_create_rotate_disable_and_delete_worker(dash_client) ->
     assert rm.status_code == 200
     assert await db.get_worker(body["id"]) is None
     assert await db.get_provider(body["provider_id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_worker_token_can_be_created_with_an_expiry(dash_client) -> None:
+    client, db = dash_client
+    uid = await db.create_dashboard_user("adm", hash_password("password-12345"), True)
+    invalidate_dashboard_user_count_cache()
+    hdr = _session_cookie_header(uid)
+
+    r = await client.post(
+        "/api/workers", headers=hdr, json={"name": "bob", "expires_in_days": 30}
+    )
+    assert r.status_code == 200, r.text
+    expires = r.json()["token_expires_at"]
+    assert abs(expires - (time.time() + 30 * 86400)) < 60
+    assert (await db.get_worker(r.json()["id"]))["token_expires_at"] == expires
+
+    bad = await client.post(
+        "/api/workers", headers=hdr, json={"name": "carol", "expires_in_days": 99999}
+    )
+    assert bad.status_code == 400
+    assert await db.get_provider_by_name("carol") is None
 
 
 @pytest.mark.asyncio

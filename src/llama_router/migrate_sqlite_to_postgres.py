@@ -79,6 +79,7 @@ _TABLES: list[tuple[str, list[str]]] = [
             "name",
             "token_hash",
             "token_prefix",
+            "token_expires_at",
             "provider_id",
             "enabled",
             "created_at",
@@ -169,6 +170,7 @@ _TABLES: list[tuple[str, list[str]]] = [
             "created_at",
             "last_used_at",
             "owner_user_id",
+            "label",
         ],
     ),
     (
@@ -209,6 +211,7 @@ _TABLES: list[tuple[str, list[str]]] = [
             "email",
             "display_name",
             "last_login_at",
+            "mfa_enabled",
             "session_version",
             "approved",
         ],
@@ -272,6 +275,19 @@ _TABLES: list[tuple[str, list[str]]] = [
             "last_used_at",
         ],
     ),
+    (
+        "dashboard_credentials",
+        [
+            "credential_hash",
+            "credential_id",
+            "user_id",
+            "name",
+            "public_key",
+            "sign_count",
+        ],
+    ),
+    ("dashboard_recovery_codes", ["code_hash", "user_id"]),
+    # Login proofs are intentionally not copied; sign in again after migration.
 ]
 
 # Tables with a PostgreSQL sequence on ``id`` (reset after copy).

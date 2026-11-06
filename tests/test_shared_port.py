@@ -15,7 +15,7 @@ from llama_router.dashboard import deps as dash_deps
 from llama_router.dashboard.app import app as dashboard_app
 from llama_router.dashboard.auth_core import hash_password
 from llama_router.dashboard.middleware import invalidate_dashboard_user_count_cache
-from llama_router.dashboard.routes import _hub_url_hint
+from llama_router.dashboard.routes.workers import _hub_url_hint
 from llama_router.database import Database
 from llama_router.llamacpp_api import deps as v1_deps
 from llama_router.provider_manager import ProviderManager
@@ -122,9 +122,10 @@ async def shared_client(tmp_path, monkeypatch):
 
 
 async def test_api_request_skips_dashboard_login(shared_client) -> None:
+    # Refused for want of an API key, not redirected to the dashboard login.
     r = await shared_client.get("/api/version")
-    assert r.status_code == 200
-    assert "version" in r.json()
+    assert r.status_code == 401
+    assert "API key" in r.json()["detail"]
 
 
 async def test_dashboard_still_requires_login(shared_client) -> None:

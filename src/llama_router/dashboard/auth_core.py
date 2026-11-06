@@ -9,8 +9,13 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
+from fastapi import Request
+from fastapi.responses import Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+
+from ..config import settings
 
 AUTH_COOKIE = "lr_session"
 SESSION_MAX_AGE = 14 * 24 * 3600
@@ -94,6 +99,7 @@ class SessionToken:
     # tokens minted without one (tests); the dashboard always binds it.
     username: str | None
     issued_at: float
+    mfa_verified: bool = False
 
     def valid_for(self, row: Mapping[str, Any], now: float | None = None) -> bool:
         """Whether this cookie still signs in the account *row*."""
@@ -108,10 +114,19 @@ class SessionToken:
 
 
 def sign_session(
-    user_id: int, secret: str, version: int = 0, username: str | None = None
+    user_id: int,
+    secret: str,
+    version: int = 0,
+    username: str | None = None,
+    *,
+    mfa_verified: bool = False,
 ) -> str:
     ser = URLSafeTimedSerializer(secret, salt="lr-dash-v1")
-    payload: dict[str, Any] = {"u": user_id, "v": version}
+    payload: dict[str, Any] = {
+        "u": user_id,
+        "v": version,
+        "mfa": mfa_verified,
+    }
     if username is not None:
         payload["n"] = username
     return ser.dumps(payload)
@@ -128,6 +143,7 @@ def unsign_session(token: str, secret: str) -> SessionToken | None:
             version=int(d["v"]),
             username=name if isinstance(name, str) else None,
             issued_at=ts.timestamp(),
+            mfa_verified=d.get("mfa") is True,
         )
     except (
         BadSignature,
@@ -162,6 +178,11 @@ _NON_ADMIN_FORBIDDEN_PREFIXES = (
     "/api/pulls",
     "/api/auth/allow-unauthenticated",
     "/api/hf",
+    # Token access to /metrics is checked before this, in the middleware.
+    "/metrics",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
 )
 
 
@@ -172,3 +193,70 @@ def non_admin_forbidden_get_path(path: str) -> bool:
         if path == prefix or path.startswith(prefix + "/"):
             return True
     return path.startswith("/api/benchmarks/fill-missing")
+
+
+def _safe_next_url(next_raw: str | None) -> str:
+    """Reject absolute and scheme-relative URLs; allow same-site relative paths only."""
+    n = (next_raw or "/").strip()
+    if not n or "\n" in n or "\r" in n:
+        return "/"
+    parsed = urlparse(n)
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    path = parsed.path or "/"
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
+        return "/"
+    # Rebuild from a constant leading "/" so the caller controls only the suffix.
+    out = "/" + path[1:]
+    if parsed.query:
+        out += "?" + parsed.query
+    if parsed.fragment:
+        out += "#" + parsed.fragment
+    return out
+
+
+def _cookie_secure(request: Request) -> bool:
+    """Mark cookies Secure when configured or when the browser used HTTPS.
+
+    A reverse proxy that terminates TLS says so with ``X-Forwarded-Proto``.
+    A client that fakes the header over plain HTTP only gets a cookie its
+    own browser will not send back.
+    """
+    if (
+        settings.dashboard_cookie_secure
+        or settings.dashboard_webauthn_origin.startswith("https://")
+    ):
+        return True
+    return _external_origin(request)[0] == "https"
+
+
+def _set_session_cookie(
+    request: Request,
+    resp: Response,
+    user: dict[str, Any],
+    secret: str,
+    *,
+    mfa_verified: bool = False,
+) -> None:
+    resp.set_cookie(
+        AUTH_COOKIE,
+        sign_session(
+            user["id"],
+            secret,
+            version=user.get("session_version") or 0,
+            username=user["username"],
+            mfa_verified=mfa_verified,
+        ),
+        httponly=True,
+        samesite="lax",
+        max_age=session_max_age(user.get("auth_source") or "local"),
+        secure=_cookie_secure(request),
+    )
+
+
+def _external_origin(request: Request) -> tuple[str, str]:
+    """Scheme and host the browser used, honoring a reverse proxy's headers."""
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    scheme = proto if proto in ("http", "https") else request.url.scheme
+    return scheme, host or request.headers.get("host") or request.url.netloc

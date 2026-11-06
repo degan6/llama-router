@@ -13,26 +13,36 @@ from llama_router.dashboard import deps
 from llama_router.dashboard.auth_core import AUTH_COOKIE, hash_password, sign_session
 from llama_router.database import Database
 from llama_router.models import ProviderProtocol
+from llama_router.provider_secrets import session_signing_key
 from llama_router.registry_cache.cache import BlobCache
 
 
 class _Navigation(HTMLParser):
+    """Links in the main menu, including those in its Access and Tools menus."""
+
     def __init__(self, html: str) -> None:
         super().__init__()
-        self.in_nav = False
+        # Depth of <ul> inside #main-nav-tabs; 0 outside it.
+        self.depth = 0
         self.items: list[dict[str, str | None]] = []
+        self.menus: list[dict[str, str | None]] = []
         self.feed(html)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
-        if tag == "ul" and attributes.get("id") == "main-nav-tabs":
-            self.in_nav = True
-        if self.in_nav and "nav-link" in (attributes.get("class") or "").split():
+        if tag == "ul" and (self.depth or attributes.get("id") == "main-nav-tabs"):
+            self.depth += 1
+        classes = (attributes.get("class") or "").split()
+        if not self.depth:
+            return
+        if "dropdown-toggle" in classes:
+            self.menus.append(attributes)
+        elif "nav-link" in classes or "dropdown-item" in classes:
             self.items.append(attributes)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "ul":
-            self.in_nav = False
+        if tag == "ul" and self.depth:
+            self.depth -= 1
 
 
 @pytest.mark.parametrize("role", ["admin", "viewer"])
@@ -51,21 +61,26 @@ async def test_navigation_stays_consistent_across_pages(
     user_id = await db.create_dashboard_user(
         "test-user", hash_password("test-password"), role == "admin"
     )
-    client.cookies.set(AUTH_COOKIE, sign_session(user_id, settings.session_secret))
+    client.cookies.set(AUTH_COOKIE, sign_session(user_id, session_signing_key()))
     provider = await db.add_provider("test-provider", ProviderProtocol.OLLAMA)
     pages = ["/", "/chat", "/my-keys", "/decisions", f"/providers/{provider.id}"]
-    expected = ["/#providers-pane", "/#benchmarks-pane", "/#models-pane", "/chat"]
+    # Operate tabs, then the Access menu (admins only), then Tools.
+    expected = ["/#providers-pane", "/#benchmarks-pane", "/#models-pane"]
     if role != "viewer":
         pages.append("/users")
-        expected.extend(["/users", "/#keys-pane", "/#workers-pane", "/#log-pane"])
+        expected.extend(["/#workers-pane", "/#log-pane"])
         if cache is not None:
             expected.append("/#cache-pane")
+        expected.extend(["/#keys-pane", "/#routing-pane", "/users"])
+    else:
+        expected.append("/#log-pane")
+    expected.extend(["/decisions", "/chat"])
 
     for path in pages:
         response = await client.get(path)
         assert response.status_code == 200, path
         items = _Navigation(response.text).items
-        # Provider details and Decisions append their page-specific marker.
+        # Provider details append their page-specific marker.
         shared = [
             item for item in items if item.get("href") or item.get("data-bs-target")
         ]
@@ -74,9 +89,15 @@ async def test_navigation_stays_consistent_across_pages(
         ]
         assert destinations == expected, path
         active = [
-            item for item in items if "active" in (item.get("class") or "").split()
+            item for item in shared if "active" in (item.get("class") or "").split()
         ]
-        if path in ("/", "/chat", "/users"):
+        # The menu holding the current page is marked too.
+        open_menus = [
+            m for m in _Navigation(response.text).menus if "active" in str(m["class"])
+        ]
+        assert len(open_menus) == (path in ("/chat", "/users", "/decisions")), path
+        assert response.text.count('href="/decisions"') == 1, path
+        if path in ("/", "/chat", "/users", "/decisions"):
             assert len(active) == 1, path
             assert active[0].get("href") == path or (
                 path == "/" and active[0].get("data-bs-target") == "#providers-pane"

@@ -8,7 +8,8 @@ from pytest_httpx import HTTPXMock
 
 from llama_router.database import Database
 from llama_router.models import ProviderModel, ProviderProtocol
-from llama_router.provider_manager import ProviderManager, worker_protocol
+from llama_router.provider_manager import ProviderManager
+from llama_router.worker_sync import worker_protocol
 
 
 def test_parse_accepts_old_name_and_rejects_both() -> None:
@@ -49,7 +50,8 @@ async def test_add_provider_form_takes_protocol(
         "/providers/add",
         data={"name": "x", "url": "http://x:8080", "protocol": "both"},
     )
-    assert r.status_code == 400
+    assert r.status_code == 303
+    assert "error=" in r.headers["location"]
     assert await db.list_providers() == []
 
     await client.post(
